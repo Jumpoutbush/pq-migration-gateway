@@ -1,0 +1,46 @@
+services:
+  bank-backend:
+    image: python:3.12-slim
+    container_name: bank-backend
+    working_dir: /app
+    command: ["python", "/app/bank_backend.py", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - ./backend:/app:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  pq-gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+      args:
+        OPENSSL_VERSION: "3.5.0"
+        NGINX_VERSION: "1.28.0"
+        MAKE_JOBS: "4"
+    container_name: pq-gateway
+    depends_on:
+      bank-backend:
+        condition: service_healthy
+    ports:
+      - "8443:8443"
+    environment:
+      GATEWAY_LISTEN_PORT: "8443"
+      GATEWAY_SERVER_NAME: "bank-gateway.local"
+      GATEWAY_CERT: "/etc/pq-gateway/certs/server.crt"
+      GATEWAY_KEY: "/etc/pq-gateway/certs/server.key"
+      # Migration default: hybrid PQ first, classical fallback for legacy clients.
+      # Strict PQC/hybrid-only test: set this to X25519MLKEM768.
+      TLS_GROUPS: "X25519MLKEM768:X25519"
+      UPSTREAM_URL: "http://bank-backend:8080"
+      UPSTREAM_TLS_VERIFY: "off"
+      # off | optional | required
+      CLIENT_AUTH: "off"
+      CLIENT_CA: "/etc/pq-gateway/certs/ca.crt"
+    volumes:
+      - ./certs:/etc/pq-gateway/certs:ro
+      - ./scripts:/workspace/scripts:ro

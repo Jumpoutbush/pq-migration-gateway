@@ -1,0 +1,18 @@
+# Generated keys and certificates. Do not commit real secrets.
+certs/*.key
+certs/*.crt
+certs/*.csr
+certs/*.srl
+certs/mldsa-demo/
+
+# Generated scan/benchmark output.
+crypto-inventory.json
+crypto-inventory.csv
+tls-probe.json
+handshake-bench.json
+
+# Local editor/runtime.
+.env
+__pycache__/
+*.pyc
+.DS_Store

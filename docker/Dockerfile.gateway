@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+# Build a TLS reverse proxy against OpenSSL 3.5+ so the gateway can negotiate
+# TLS 1.3 hybrid post-quantum groups such as X25519MLKEM768.
+
+FROM ubuntu:24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG OPENSSL_VERSION=3.5.0
+ARG NGINX_VERSION=1.28.0
+ARG MAKE_JOBS=4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    wget \
+    perl \
+    linux-libc-dev \
+    zlib1g-dev \
+    libpcre3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+RUN wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
+    && tar xzf "openssl-${OPENSSL_VERSION}.tar.gz" \
+    && cd "openssl-${OPENSSL_VERSION}" \
+    && ./config --prefix=/opt/openssl --openssldir=/opt/openssl/ssl --libdir=lib shared no-tests \
+    && make -j"${MAKE_JOBS}" \
+    && make install_sw
+
+RUN wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+    && tar xzf "nginx-${NGINX_VERSION}.tar.gz" \
+    && cd "nginx-${NGINX_VERSION}" \
+    && ./configure \
+       --prefix=/opt/nginx \
+       --sbin-path=/opt/nginx/sbin/nginx \
+       --conf-path=/opt/nginx/conf/nginx.conf \
+       --pid-path=/tmp/nginx.pid \
+       --lock-path=/tmp/nginx.lock \
+       --http-log-path=/var/log/nginx/access.log \
+       --error-log-path=/var/log/nginx/error.log \
+       --with-http_ssl_module \
+       --with-http_v2_module \
+       --with-http_realip_module \
+       --with-http_stub_status_module \
+       --with-stream \
+       --with-stream_ssl_module \
+       --with-threads \
+       --with-openssl="/build/openssl-${OPENSSL_VERSION}" \
+       --with-openssl-opt="--prefix=/opt/openssl --openssldir=/opt/openssl/ssl --libdir=lib no-tests" \
+       --with-ld-opt="-Wl,-rpath,/opt/openssl/lib" \
+    && make -j"${MAKE_JOBS}" \
+    && make install
+
+FROM ubuntu:24.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gettext-base \
+    curl \
+    zlib1g \
+    libpcre3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /etc/pq-gateway/templates /etc/pq-gateway/certs /var/log/nginx /var/cache/nginx/client_temp /tmp/pq-gateway
+
+COPY --from=build /opt/openssl /opt/openssl
+COPY --from=build /opt/nginx /opt/nginx
+COPY gateway/templates/nginx.conf.template /etc/pq-gateway/templates/nginx.conf.template
+COPY gateway/entrypoint.sh /entrypoint.sh
+
+ENV PATH="/opt/openssl/bin:/opt/nginx/sbin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/openssl/lib:${LD_LIBRARY_PATH}" \
+    GATEWAY_LISTEN_PORT="8443" \
+    GATEWAY_SERVER_NAME="bank-gateway.local" \
+    TLS_GROUPS="X25519MLKEM768:X25519" \
+    UPSTREAM_URL="http://bank-backend:8080" \
+    CLIENT_AUTH="off" \
+    UPSTREAM_TLS_VERIFY="off"
+
+EXPOSE 8443
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,16 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python syntax check
+        run: python -m py_compile backend/bank_backend.py scripts/crypto_inventory.py scripts/tls_probe.py scripts/bench_handshake.py
