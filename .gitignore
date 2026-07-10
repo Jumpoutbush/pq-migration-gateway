@@ -16,3 +16,6 @@ handshake-bench.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# Experiment outputs
+experiment-results/

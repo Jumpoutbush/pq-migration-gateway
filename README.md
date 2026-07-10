@@ -1,72 +1,98 @@
-# PQC Migration Gateway for Banking Services
+# PQC Migration Gateway
 
-一个可插入“银行客户端 ↔ 银行服务端”之间的后量子迁移反向代理网关最小工程。
+一个面向存量银行服务的后量子迁移网关原型。项目使用 **NGINX 1.28.0 + OpenSSL 3.5.0**，在不修改后端业务代码的情况下，为客户端入口提供 TLS 1.3 Hybrid/PQC 密钥交换，并集成密码资产扫描与握手性能测试。
 
-核心目标不是自己实现 ML-KEM / ML-DSA，而是使用 OpenSSL 3.5+ 的标准实现，在服务入口先完成 TLS 1.3 hybrid/PQC 密钥交换迁移，同时让后端银行服务可以暂时保持原有 HTTP/TLS 架构不变。
+当前默认保持兼容迁移配置：
 
-## 1. 架构定位
-
-```text
-银行客户端
-  |
-  |  TLS 1.3，优先 X25519MLKEM768，可选 mTLS
-  v
-+------------------------------------------------+
-| 后量子迁移网关                                  |
-| NGINX + OpenSSL 3.5+                            |
-| - 前端 TLS hybrid/PQC KEX                       |
-| - 可选客户端证书校验                             |
-| - 反向代理到存量银行服务                         |
-| - JSON 审计日志                                  |
-| - TLS/证书/配置扫描脚本                          |
-+------------------------------------------------+
-  |
-  |  HTTP 或传统 TLS，按存量系统能力配置
-  v
-银行服务端 / 核心业务系统
+```yaml
+TLS_GROUPS: "X25519MLKEM768:X25519"
 ```
 
-这个工程适合做三件事：
-
-1. 在不改后端业务代码的情况下，先把客户端入口升级为 hybrid/PQC TLS。
-2. 在迁移期保留经典 fallback，逐步识别不支持 PQC 的客户端。
-3. 扫描证书、私钥、TLS 配置和源码引用，形成密码资产清单。
-
-## 2. 使用的算法与参数
-
-默认不手写密码算法。算法由 OpenSSL 3.5+ 提供。
-
-| 层次 | 默认配置 | 说明 |
-|---|---|---|
-| 前端 TLS 协议 | TLS 1.3 only | 网关只暴露 TLS 1.3 |
-| 前端 TLS KEX | `X25519MLKEM768:X25519` | 迁移模式：优先 hybrid PQ，允许经典 fallback |
-| 严格测试 KEX | `X25519MLKEM768` | 只允许 hybrid PQ；用于验证 PQ-ready 客户端 |
-| 默认服务端证书 | RSA-3072 demo cert | 兼容性最高；真实部署应换成银行 PKI 证书 |
-| 可选实验签名证书 | `ML-DSA-65` | 需要 OpenSSL 3.5+，用于实验 PQ 证书链 |
-| 后端连接 | HTTP 或 HTTPS | 后端可暂时不支持 PQC |
-
-注意：TLS 密钥交换迁移和证书签名迁移是两个不同环节。本工程默认先迁移 TLS KEX，因为它对后端业务系统侵入最小。应用层报文签名、HSM、证书链、客户端 SDK 需要另行迁移。
-
-## 3. 目录结构
+含义是：支持 PQC 的客户端优先使用 `X25519MLKEM768`，传统客户端可以回退到 `X25519`。
 
 ```text
-pq-migration-gateway/
-├── backend/                    # 模拟银行后端服务，无 PQC 依赖
-├── certs/                      # demo 证书生成脚本，生成物默认不提交
-├── docker/                     # OpenSSL 3.5 + NGINX 网关镜像
-├── docs/                       # 架构与部署说明
-├── gateway/                    # NGINX 模板与 entrypoint
-├── scripts/                    # TLS probe、握手 benchmark、密码资产扫描
-├── docker-compose.yml
-├── Makefile
-└── README.md
+客户端
+  |
+  | TLS 1.3
+  | X25519MLKEM768 或 X25519
+  v
++--------------------------------+
+| PQC Migration Gateway          |
+| NGINX + OpenSSL 3.5            |
++--------------------------------+
+  |
+  | HTTP 或传统 HTTPS
+  v
+存量银行服务
 ```
 
-## 4. Ubuntu 24.04 环境准备
+## 1. 当前支持功能
+
+### 后量子迁移网关
+
+- TLS 1.3 服务入口；
+- `X25519MLKEM768` Hybrid/PQC 密钥交换；
+- `X25519` 经典客户端回退；
+- RSA-3072 演示证书链；
+- 可选客户端证书认证（mTLS）；
+- HTTP 或 HTTPS 后端反向代理；
+- JSON 格式访问日志；
+- 后端业务系统无需实现 PQC。
+
+当前已验证：
+
+| 实验                       | 结果 |
+| -------------------------- | ---- |
+| TLS 1.3 + `X25519MLKEM768` | 成功 |
+| TLS 1.3 + `X25519`         | 成功 |
+| RSA 服务端证书验证         | 成功 |
+| NGINX 到模拟银行后端转发   | 成功 |
+| Docker Compose 部署        | 成功 |
+
+当前迁移状态：
+
+```text
+TLS 密钥交换层：已支持 Hybrid/PQC
+证书认证层：仍使用 RSA
+后端业务层：保持原有 HTTP/HTTPS 架构
+```
+
+### 密码资产扫描
+
+`scripts/crypto_inventory.py` 当前支持扫描：
+
+- X.509 证书；
+- 私钥文件；
+- RSA、ML-DSA 等算法引用；
+- TLS 和 NGINX 配置；
+- Shell、Compose 等文本配置；
+- 风险等级和量子安全状态；
+- JSON 和 CSV 报告输出。
+
+### 实验工具
+
+- `tls_probe.py`：检查 TLS 版本、证书和协商 group；
+- `bench_handshake.py`：比较不同 TLS group 的握手性能；
+- `crypto_inventory.py`：生成密码资产清单；
+- `run_full_experiment.sh`：自动执行完整实验并保存结果。
+
+---
+
+## 2. 启动项目与运行实验
+
+### 2.1 环境要求
+
+- Ubuntu 24.04；
+- Docker Engine；
+- Docker Compose V2；
+- Git、Make、Python 3 和 curl。
+
+安装基础工具：
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl git make unzip docker.io docker-compose-plugin gh
+sudo apt install -y ca-certificates curl git make unzip python3 docker.io docker-compose-v2
+
 sudo usermod -aG docker "$USER"
 newgrp docker
 
@@ -74,406 +100,245 @@ docker version
 docker compose version
 ```
 
-如果不使用 GitHub CLI，可以不安装 `gh`。
+已经安装 Docker 和 Compose 的环境可以跳过此步骤。
 
-## 5. 一键启动 demo
+### 2.2 首次启动
+
+进入项目目录：
 
 ```bash
-git clone <your-repo-url> pq-migration-gateway
-cd pq-migration-gateway
+cd ~/wkspace/pq-migration-gateway
+```
 
+生成演示证书：
+
+```bash
 make certs
+```
+
+标准网络环境下构建并启动：
+
+```bash
 make build
 make up
 ```
 
-等容器启动后：
+检查服务状态：
 
 ```bash
 docker compose ps
 ```
 
-预期看到：
+预期：
 
 ```text
-bank-backend   running / healthy
-pq-gateway     running
+bank-backend   Up (healthy)
+pq-gateway     Up
 ```
 
-## 6. 普通 HTTPS 访问测试
+### 2.3 WSL 代理环境构建
 
-主机上的 `curl` 未必使用 OpenSSL 3.5，所以这个测试只能证明 HTTPS 反向代理可用，不一定证明协商到了 PQC/hybrid 组。
+Windows HTTP 代理监听在 `127.0.0.1:7897` 时：
 
 ```bash
-curl --resolve bank-gateway.local:8443:127.0.0.1 \
-  --cacert certs/ca.crt \
-  https://bank-gateway.local:8443/healthz
-
-curl --resolve bank-gateway.local:8443:127.0.0.1 \
-  --cacert certs/ca.crt \
-  https://bank-gateway.local:8443/api/balance
-
-curl --resolve bank-gateway.local:8443:127.0.0.1 \
-  --cacert certs/ca.crt \
-  -H 'Content-Type: application/json' \
-  -d '{"from":"demo-001","to":"demo-002","amount":"100.00","currency":"CNY"}' \
-  https://bank-gateway.local:8443/api/transfer
+docker build   --network=host   --build-arg OPENSSL_VERSION=3.5.0   --build-arg NGINX_VERSION=1.28.0   --build-arg MAKE_JOBS=4   --build-arg HTTP_PROXY=http://127.0.0.1:7897   --build-arg HTTPS_PROXY=http://127.0.0.1:7897   --build-arg http_proxy=http://127.0.0.1:7897   --build-arg https_proxy=http://127.0.0.1:7897   --build-arg NO_PROXY=localhost,127.0.0.1,::1   --build-arg no_proxy=localhost,127.0.0.1,::1   -f docker/Dockerfile.gateway   -t pq-migration-gateway-pq-gateway   .
 ```
 
-## 7. 强制验证 hybrid/PQC TLS 协商
-
-使用网关容器内的 OpenSSL 3.5 客户端强制 `X25519MLKEM768`：
+构建成功后：
 
 ```bash
-docker compose exec pq-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect pq-gateway:8443 \
-  -servername bank-gateway.local \
-  -tls1_3 \
-  -groups X25519MLKEM768 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief < /dev/null
+docker compose up -d --no-build
+docker compose ps
 ```
 
-输出中应出现类似字段：
+### 2.4 日常启动与停止
 
-```text
-Protocol version: TLSv1.3
-Ciphersuite: TLS_AES_256_GCM_SHA384
-Server Temp Key: X25519MLKEM768
-Verification: OK
-```
-
-也可以使用封装好的 probe 脚本：
+镜像和证书已经生成后，机器重启通常只需：
 
 ```bash
-docker compose exec pq-gateway \
-  python3 /workspace/scripts/tls_probe.py \
-  --host pq-gateway \
-  --port 8443 \
-  --sni bank-gateway.local \
-  --groups X25519MLKEM768 \
-  --openssl /opt/openssl/bin/openssl \
-  --cafile /etc/pq-gateway/certs/ca.crt \
-  --json /tmp/tls-probe.json
+cd ~/wkspace/pq-migration-gateway
+docker compose up -d --no-build
+docker compose ps
 ```
 
-## 8. 切换严格 hybrid-only 模式
-
-默认配置是迁移模式：
-
-```text
-TLS_GROUPS=X25519MLKEM768:X25519
-```
-
-这表示优先 hybrid PQ，但允许传统 X25519 fallback。要测试强制 hybrid-only：
+停止项目：
 
 ```bash
-TLS_GROUPS=X25519MLKEM768 docker compose up -d --force-recreate pq-gateway
+docker compose down
 ```
 
-或者修改 `docker-compose.yml`：
-
-```yaml
-environment:
-  TLS_GROUPS: "X25519MLKEM768"
-```
-
-然后重启：
-
-```bash
-docker compose up -d --force-recreate pq-gateway
-```
-
-此时不支持 `X25519MLKEM768` 的客户端应握手失败。这是识别 legacy 客户端的关键测试。
-
-## 9. 启用客户端证书认证 mTLS
-
-默认关闭客户端证书校验：
-
-```yaml
-CLIENT_AUTH: "off"
-```
-
-可选值：
-
-```text
-off       不校验客户端证书
-optional  有证书则校验，无证书也放行
-required  必须提供有效客户端证书
-```
-
-启动 optional mTLS：
-
-```bash
-CLIENT_AUTH=optional docker compose up -d --force-recreate pq-gateway
-```
-
-启动 required mTLS：
-
-```bash
-CLIENT_AUTH=required docker compose up -d --force-recreate pq-gateway
-```
-
-使用客户端证书访问：
-
-```bash
-curl --resolve bank-gateway.local:8443:127.0.0.1 \
-  --cacert certs/ca.crt \
-  --cert certs/client.crt \
-  --key certs/client.key \
-  https://bank-gateway.local:8443/api/balance
-```
-
-## 10. 接入真实银行后端服务
-
-如果后端是传统 HTTP：
-
-```yaml
-environment:
-  UPSTREAM_URL: "http://10.10.10.20:8080"
-  UPSTREAM_TLS_VERIFY: "off"
-```
-
-如果后端是传统 HTTPS 且需要校验证书：
-
-```yaml
-environment:
-  UPSTREAM_URL: "https://bank-core.internal:443"
-  UPSTREAM_TLS_VERIFY: "on"
-  UPSTREAM_CA: "/etc/pq-gateway/certs/upstream-ca.crt"
-volumes:
-  - ./certs:/etc/pq-gateway/certs:ro
-```
-
-然后重启：
-
-```bash
-docker compose up -d --force-recreate pq-gateway
-```
-
-生产环境不建议关闭后端 TLS 校验。只有本地 demo 或隔离测试环境可以使用 `UPSTREAM_TLS_VERIFY=off`。
-
-## 11. 生成可选 ML-DSA demo 证书
-
-需要 OpenSSL 3.5+。如果主机没有 OpenSSL 3.5，可以复用本工程构建出的网关镜像：
-
-```bash
-docker build -t pq-gateway-openssl35 -f docker/Dockerfile.gateway .
-docker run --rm \
-  -v "$PWD/certs:/certs" \
-  --entrypoint sh \
-  pq-gateway-openssl35 \
-  -lc 'OPENSSL_BIN=/opt/openssl/bin/openssl MLDSA_ALG=ML-DSA-65 /certs/gen-mldsa-demo-certs.sh /certs/mldsa-demo'
-```
-
-如果主机已经安装 OpenSSL 3.5+，也可以直接运行：
-
-```bash
-OPENSSL_BIN=/path/to/openssl-3.5/bin/openssl \
-  MLDSA_ALG=ML-DSA-65 \
-  ./certs/gen-mldsa-demo-certs.sh ./certs/mldsa-demo
-```
-
-然后在 `docker-compose.yml` 中把证书路径改为：
-
-```yaml
-environment:
-  GATEWAY_CERT: "/etc/pq-gateway/certs/mldsa-demo/server.crt"
-  GATEWAY_KEY: "/etc/pq-gateway/certs/mldsa-demo/server.key"
-  CLIENT_CA: "/etc/pq-gateway/certs/mldsa-demo/ca.crt"
-```
-
-说明：ML-DSA 证书链仍属于实验性接入场景。真实银行系统要结合浏览器、客户端 SDK、HSM、证书策略、监管要求和兼容性测试决定何时启用。
-
-## 12. 密码资产扫描
-
-扫描当前工程的证书、配置和源码引用：
-
-```bash
-python3 scripts/crypto_inventory.py \
-  --root ./certs \
-  --root ./gateway \
-  --root ./docker-compose.yml \
-  --out-json crypto-inventory.json \
-  --out-csv crypto-inventory.csv
-```
-
-扫描系统路径示例：
-
-```bash
-sudo python3 scripts/crypto_inventory.py \
-  --root /etc/nginx \
-  --root /etc/apache2 \
-  --root /etc/ssl \
-  --out-json bank-host-crypto-inventory.json \
-  --out-csv bank-host-crypto-inventory.csv
-```
-
-输出字段包括：
-
-| 字段 | 含义 |
-|---|---|
-| `path` | 资产或引用所在文件 |
-| `finding_type` | 证书、私钥、文本配置/源码引用 |
-| `algorithm` | 检出的算法或模式 |
-| `key_bits` | 密钥位数，能解析时填充 |
-| `risk` | `CRITICAL/HIGH/MEDIUM/LOW/INFO` |
-| `pq_status` | 是否 quantum-vulnerable 或 PQC/candidate |
-| `recommendation` | 迁移建议 |
-
-这个扫描器是迁移原型，不是完整企业级 CASB/CMDB/HSM 发现平台。银行生产环境还应接入：
-
-- HSM/KMS 密钥清单；
-- 证书生命周期平台；
-- VPN/IKEv2 配置；
-- TLS 端口全网扫描；
-- Java keystore / PKCS#12；
-- SBOM/CBOM；
-- 业务系统 owner 和数据生命周期。
-
-## 13. TLS 握手性能测试
-
-同一台机器上比较不同 group 配置：
-
-```bash
-docker compose exec pq-gateway \
-  python3 /workspace/scripts/bench_handshake.py \
-  --host pq-gateway \
-  --port 8443 \
-  --sni bank-gateway.local \
-  --groups X25519MLKEM768 \
-  --openssl /opt/openssl/bin/openssl \
-  --cafile /etc/pq-gateway/certs/ca.crt \
-  --count 50 \
-  --out /tmp/handshake-bench.json
-```
-
-经典对照：
-
-```bash
-docker compose exec pq-gateway \
-  python3 /workspace/scripts/bench_handshake.py \
-  --host pq-gateway \
-  --port 8443 \
-  --sni bank-gateway.local \
-  --groups X25519 \
-  --openssl /opt/openssl/bin/openssl \
-  --cafile /etc/pq-gateway/certs/ca.crt \
-  --count 50
-```
-
-该脚本是工程回归测试，不是严谨密码算法 benchmark。正式性能报告应固定 CPU、关闭频率抖动、隔离网络噪声、区分握手耗时、证书链验证耗时、应用代理耗时和后端耗时。
-
-## 14. 日志与审计
-
-查看网关日志：
+查看日志：
 
 ```bash
 docker compose logs -f pq-gateway
 ```
 
-访问日志是 JSON，包含：
+### 2.5 手工验证 Hybrid/PQC TLS
 
-```json
-{
-  "ssl_protocol": "TLSv1.3",
-  "ssl_cipher": "TLS_AES_256_GCM_SHA384",
-  "ssl_curve": "X25519MLKEM768",
-  "client_verify": "NONE",
-  "upstream_addr": "bank-backend:8080"
-}
-```
-
-生产中建议把 `/var/log/nginx/access.log` 接入 SIEM，并对 `ssl_curve` 做告警：如果目标端点应为 hybrid/PQ，但出现长期 `X25519`，说明发生 fallback 或客户端未升级。
-
-## 15. GitHub 建库与上传命令
-
-### 15.1 使用 GitHub CLI
+验证 `X25519MLKEM768`：
 
 ```bash
-cd pq-migration-gateway
-
-git init
-git add .
-git commit -m "Initial PQC migration gateway"
-
-gh auth login
-gh repo create YOUR_ORG_OR_USER/pq-migration-gateway \
-  --private \
-  --description "Post-quantum migration gateway prototype for banking services" \
-  --source=. \
-  --remote=origin \
-  --push
+docker compose exec pq-gateway   /opt/openssl/bin/openssl s_client   -connect localhost:8443   -servername bank-gateway.local   -tls1_3   -groups X25519MLKEM768   -CAfile /etc/pq-gateway/certs/ca.crt   -brief < /dev/null
 ```
 
-### 15.2 不使用 GitHub CLI
+预期包含：
 
-先在 GitHub 网页创建空仓库，然后：
+```text
+Protocol version: TLSv1.3
+Verification: OK
+Negotiated TLS1.3 group: X25519MLKEM768
+```
+
+验证 `X25519` 回退：
 
 ```bash
-cd pq-migration-gateway
-
-git init
-git add .
-git commit -m "Initial PQC migration gateway"
-git branch -M main
-git remote add origin git@github.com:YOUR_ORG_OR_USER/pq-migration-gateway.git
-git push -u origin main
+docker compose exec pq-gateway   /opt/openssl/bin/openssl s_client   -connect localhost:8443   -servername bank-gateway.local   -tls1_3   -groups X25519   -CAfile /etc/pq-gateway/certs/ca.crt   -brief < /dev/null
 ```
 
-不要提交真实银行证书、私钥、HSM 凭据、生产域名清单或扫描结果。`.gitignore` 已排除 demo 证书生成物和扫描输出，但提交前仍应人工检查：
+预期包含：
+
+```text
+Protocol version: TLSv1.3
+Verification: OK
+Peer Temp Key: X25519
+```
+
+### 2.6 业务接口测试
+
+健康检查：
 
 ```bash
-git status --ignored
-git diff --cached --name-only
+curl --resolve bank-gateway.local:8443:127.0.0.1   --cacert certs/ca.crt   https://bank-gateway.local:8443/healthz
 ```
 
-## 16. 常用运维命令
+余额接口：
 
 ```bash
-# 启动
-make up
-
-# 停止
-make down
-
-# 查看日志
-make logs
-
-# 重新生成 demo 证书
-make clean
-make certs
-
-# 重新构建网关镜像
-docker compose build --no-cache pq-gateway
-
-# 查看 OpenSSL 算法
-docker compose exec pq-gateway /opt/openssl/bin/openssl version -a
-docker compose exec pq-gateway /opt/openssl/bin/openssl list -kem-algorithms | grep -E 'ML-KEM|MLKEM'
-docker compose exec pq-gateway /opt/openssl/bin/openssl list -signature-algorithms | grep -E 'ML-DSA|MLDSA|SLH-DSA'
-
-# 查看 NGINX 编译参数
-docker compose exec pq-gateway /opt/nginx/sbin/nginx -V
+curl --resolve bank-gateway.local:8443:127.0.0.1   --cacert certs/ca.crt   https://bank-gateway.local:8443/api/balance
 ```
 
-## 17. 生产边界声明
+转账接口：
 
-这个工程是“可运行迁移原型”，不是银行生产系统成品。生产化前至少需要补齐：
+```bash
+curl --resolve bank-gateway.local:8443:127.0.0.1   --cacert certs/ca.crt   -H 'Content-Type: application/json'   -d '{"from":"demo-001","to":"demo-002","amount":"100.00","currency":"CNY"}'   https://bank-gateway.local:8443/api/transfer
+```
 
-1. 银行 PKI / 证书生命周期系统接入；
-2. HSM/KMS 中密钥生成、存储、签名和审计策略；
-3. 双机热备、灰度发布、回滚策略；
-4. SIEM、指标、告警和审计报表；
-5. API 级鉴权、WAF、限流、DDoS 保护；
-6. 客户端 SDK 兼容性矩阵；
-7. 监管、等保、商密、FIPS 或本地密码合规验证。
+### 2.7 运行完整实验
 
-## 18. 参考
+确保脚本可执行：
 
-- OpenSSL 3.5 release: native support for ML-KEM, ML-DSA, and SLH-DSA.
-  <https://openssl-library.org/post/2025-04-08-openssl-35-final-release/>
-- OpenSSL 3.5 TLS group documentation: `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024`.
-  <https://docs.openssl.org/3.5/man3/SSL_CTX_set1_curves/>
-- Open Quantum Safe provider note: OpenSSL 3.5+ has native standardized PQ algorithm families.
-  <https://github.com/open-quantum-safe/oqs-provider>
+```bash
+chmod +x scripts/run_full_experiment.sh
+```
+
+运行：
+
+```bash
+./scripts/run_full_experiment.sh
+```
+
+每种 TLS group 执行 100 次握手：
+
+```bash
+COUNT=100 ./scripts/run_full_experiment.sh
+```
+
+脚本自动执行：
+
+1. 检查 `TLS_GROUPS` 是否为 `X25519MLKEM768:X25519`；
+2. 启动现有容器；
+3. 验证 Hybrid/PQC 握手；
+4. 验证 X25519 回退；
+5. 测试健康、余额和转账接口；
+6. 运行密码资产扫描；
+7. 对两种 TLS group 进行握手性能测试；
+8. 保存 OpenSSL、NGINX 和网关日志。
+
+实验结果保存在：
+
+```text
+experiment-results/<UTC时间戳>/
+```
+
+`.gitignore` 中应包含：
+
+```gitignore
+experiment-results/
+```
+
+### 2.8 单独运行密码资产扫描
+
+```bash
+python3 scripts/crypto_inventory.py   --root ./certs   --root ./gateway   --root ./docker-compose.yml   --out-json crypto-inventory.json   --out-csv crypto-inventory.csv
+```
+
+### 2.9 单独运行握手性能测试
+
+Hybrid/PQC：
+
+```bash
+docker compose exec pq-gateway   python3 /workspace/scripts/bench_handshake.py   --host pq-gateway   --port 8443   --sni bank-gateway.local   --groups X25519MLKEM768   --openssl /opt/openssl/bin/openssl   --cafile /etc/pq-gateway/certs/ca.crt   --count 50   --out /tmp/handshake-hybrid.json
+```
+
+经典对照：
+
+```bash
+docker compose exec pq-gateway   python3 /workspace/scripts/bench_handshake.py   --host pq-gateway   --port 8443   --sni bank-gateway.local   --groups X25519   --openssl /opt/openssl/bin/openssl   --cafile /etc/pq-gateway/certs/ca.crt   --count 50   --out /tmp/handshake-x25519.json
+```
+
+---
+
+## 3. 后续改进方向
+
+### 密码资产扫描
+
+- 区分真实资产、配置引用和源码证据；
+- 对证书、私钥和配置进行去重关联；
+- 准确识别 RSA、ECDSA、ML-DSA、SLH-DSA 和 Hybrid group；
+- 增加在线 TLS 端点扫描；
+- 检测实际协商 group 和经典回退；
+- 支持 Java KeyStore、PKCS#12、SSH、VPN/IKEv2；
+- 接入 HSM、KMS、CMDB、证书平台和 SBOM/CBOM；
+- 增加业务 owner、数据生命周期和迁移优先级。
+
+### 迁移网关
+
+- 完成 RSA mTLS 全流程测试；
+- 测试 ML-DSA 服务端和客户端证书；
+- 支持后端 HTTPS 和后端 mTLS；
+- 增加按域名、客户端和接口的迁移策略；
+- 增加 fallback 统计、告警和审计报表；
+- 支持配置热更新、灰度部署和回滚；
+- 增加高可用、限流、WAF 和监控指标；
+- 接入银行 PKI、HSM/KMS 和证书生命周期平台。
+
+### 性能评估
+
+- 固定 CPU 和运行环境；
+- 分别测量 X25519 与 X25519MLKEM768；
+- 输出平均值、标准差、P50、P95 和 P99；
+- 测量 CPU、内存、并发连接和握手吞吐量；
+- 区分 TLS 握手、证书验证、代理转发和后端处理耗时；
+- 对比 RSA 与 ML-DSA 证书链的性能和兼容性。
+
+---
+
+## 项目边界
+
+本项目当前是可运行的后量子迁移工程原型，不是银行生产系统成品。
+
+当前已完成：
+
+```text
+静态密码资产发现
+        +
+TLS 1.3 Hybrid/PQC KEX
+        +
+经典客户端回退
+        +
+存量后端反向代理
+        +
+自动化实验
+```
+
+生产部署前仍需补齐 PKI、HSM/KMS、高可用、审计、监管合规和完整安全测试。
