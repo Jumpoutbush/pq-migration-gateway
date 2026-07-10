@@ -100,7 +100,7 @@ def main() -> int:
         "elapsed_ms": round(elapsed * 1000, 3),
         "protocol": first_match(r"Protocol version:\s*([^\n]+)", combined) or first_match(r"Protocol\s*:\s*([^\n]+)", combined),
         "cipher_suite": first_match(r"Ciphersuite:\s*([^\n]+)", combined) or first_match(r"Cipher\s*:\s*([^\n]+)", combined),
-        "server_temp_key": first_match(r"Server Temp Key:\s*([^\n]+)", combined),
+        "server_temp_key": first_match(r"Negotiated TLS1\.3 group:\s*([^\n]+)", combined) or first_match(r"Server Temp Key:\s*([^\n]+)", combined) or first_match(r"Peer Temp Key:\s*([^,\n]+)", combined),
         "verification": first_match(r"Verification:\s*([^\n]+)", combined) or first_match(r"Verify return code:\s*([^\n]+)", combined),
         "peer_certificate": parse_cert(args.openssl, extract_first_cert(combined)),
         "stderr_tail": "\n".join(err.splitlines()[-10:]),

@@ -1,304 +1,267 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# PQC Migration Gateway end-to-end experiment script
-#
-# Assumptions:
-#   1. Run from the pq-migration-gateway repository root.
-#   2. The gateway image has already been built successfully.
-#   3. docker-compose.yml keeps:
-#        TLS_GROUPS: "X25519MLKEM768:X25519"
-#
+# PQC Migration Gateway v2 end-to-end experiment.
 # Usage:
-#   chmod +x scripts/run_full_experiment.sh
 #   ./scripts/run_full_experiment.sh
-#
-# Optional:
-#   COUNT=100 ./scripts/run_full_experiment.sh
+#   COUNT=100 BUILD=1 ./scripts/run_full_experiment.sh
 
-EXPECTED_TLS_GROUPS="X25519MLKEM768:X25519"
 BENCH_COUNT="${COUNT:-50}"
+BUILD="${BUILD:-0}"
 RESULT_ROOT="${RESULT_ROOT:-experiment-results}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="${RESULT_ROOT}/${TIMESTAMP}"
-
 GATEWAY_SERVICE="pq-gateway"
-BACKEND_SERVICE="bank-backend"
 GATEWAY_CONTAINER="pq-gateway"
-GATEWAY_HOSTNAME="bank-gateway.local"
-GATEWAY_PORT="8443"
-CA_FILE_HOST="certs/ca.crt"
-CA_FILE_CONTAINER="/etc/pq-gateway/certs/ca.crt"
+BACKEND_CONTAINER="bank-backend"
 OPENSSL_BIN="/opt/openssl/bin/openssl"
+CA_CONTAINER="/etc/pq-gateway/certs/ca.crt"
+CA_HOST="certs/ca.crt"
 
-mkdir -p "${RESULT_DIR}"
+mkdir -p "$RESULT_DIR"
 
-log() {
-  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
-}
-
-die() {
-  printf 'ERROR: %s\n' "$*" >&2
-  exit 1
-}
+log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+require() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
 
 on_error() {
-  local exit_code=$?
-  printf '\nExperiment failed with exit code %s.\n' "${exit_code}" >&2
+  local code=$?
+  printf '\nExperiment failed with exit code %s.\n' "$code" >&2
   docker compose ps -a >&2 || true
-  docker compose logs --no-color --tail=100 "${GATEWAY_SERVICE}" >&2 || true
-  exit "${exit_code}"
+  docker compose logs --no-color --tail=120 "$GATEWAY_SERVICE" >&2 || true
+  exit "$code"
 }
 trap on_error ERR
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
-}
-
-require_file() {
-  [[ -f "$1" ]] || die "Required file not found: $1"
-}
-
-wait_for_backend_health() {
-  local retries=30
-  local status=""
-
-  for ((i = 1; i <= retries; i++)); do
-    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
-      "${BACKEND_SERVICE}" 2>/dev/null || true)"
-    if [[ "${status}" == "healthy" ]]; then
-      return 0
-    fi
+wait_container() {
+  local container="$1" expected="$2" retries=60 status=""
+  for ((i=1; i<=retries; i++)); do
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)"
+    [[ "$status" == "$expected" ]] && return 0
     sleep 1
   done
-
-  die "${BACKEND_SERVICE} did not become healthy"
+  die "$container did not reach state $expected (last state: ${status:-missing})"
 }
 
-wait_for_gateway_running() {
-  local retries=30
-  local status=""
-
-  for ((i = 1; i <= retries; i++)); do
-    status="$(docker inspect -f '{{.State.Status}}' "${GATEWAY_CONTAINER}" 2>/dev/null || true)"
-    if [[ "${status}" == "running" ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-
-  die "${GATEWAY_SERVICE} did not remain running"
+handshake_success() {
+  local port="$1" sni="$2" group="$3" output="$4"
+  log "TLS success test: ${sni}:${port} group=${group}"
+  docker compose exec -T "$GATEWAY_SERVICE" \
+    "$OPENSSL_BIN" s_client -connect "localhost:${port}" -servername "$sni" \
+    -tls1_3 -groups "$group" -CAfile "$CA_CONTAINER" -verify_return_error -brief \
+    </dev/null >"$output" 2>&1
+  cat "$output"
+  grep -q 'Verification: OK' "$output"
+  grep -Eq "Negotiated TLS1\\.3 group: ${group}|Server Temp Key: ${group}|Peer Temp Key: ${group}" "$output"
 }
 
-run_handshake() {
-  local group="$1"
-  local output_file="$2"
-  local expected_pattern="$3"
+handshake_expected_failure() {
+  local port="$1" sni="$2" group="$3" output="$4"
+  local rc
 
-  log "Testing TLS 1.3 group: ${group}"
+  log "TLS rejection test: ${sni}:${port} group=${group}"
 
-  docker compose exec -T "${GATEWAY_SERVICE}" \
-    "${OPENSSL_BIN}" s_client \
-    -connect "localhost:${GATEWAY_PORT}" \
-    -servername "${GATEWAY_HOSTNAME}" \
-    -tls1_3 \
-    -groups "${group}" \
-    -CAfile "${CA_FILE_CONTAINER}" \
-    -brief \
-    </dev/null 2>&1 | tee "${output_file}"
+  if docker compose exec -T "$GATEWAY_SERVICE" \
+    "$OPENSSL_BIN" s_client \
+      -connect "localhost:${port}" \
+      -servername "$sni" \
+      -tls1_3 \
+      -groups "$group" \
+      -CAfile "$CA_CONTAINER" \
+      -brief \
+      </dev/null >"$output" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
 
-  grep -q "Verification: OK" "${output_file}" \
-    || die "Certificate verification failed for group ${group}"
+  cat "$output"
 
-  grep -Eq "${expected_pattern}" "${output_file}" \
-    || die "Expected negotiated group not found for ${group}"
+  if grep -q 'Verification: OK' "$output" &&
+     grep -Eq 'Negotiated TLS1\.3 group:|Server Temp Key:|Peer Temp Key:' "$output"
+  then
+    die "Expected ${sni}:${port} to reject group ${group}, but TLS succeeded"
+  fi
+
+  if [[ $rc -eq 0 ]]; then
+    die "Expected TLS rejection, but openssl returned success"
+  fi
+
+  if grep -Eqi \
+    'alert handshake failure|alert number 40|no suitable key share|handshake failure' \
+    "$output"
+  then
+    log "Expected TLS rejection confirmed"
+  else
+    log "TLS connection was rejected with exit code ${rc}"
+  fi
 }
 
-run_http_get() {
-  local path="$1"
-  local output_file="$2"
-
-  log "Requesting HTTPS endpoint: ${path}"
-
-  curl \
-    --noproxy '*' \
-    --fail-with-body \
-    --silent \
-    --show-error \
-    --connect-timeout 10 \
-    --max-time 30 \
-    --resolve "${GATEWAY_HOSTNAME}:${GATEWAY_PORT}:127.0.0.1" \
-    --cacert "${CA_FILE_HOST}" \
-    "https://${GATEWAY_HOSTNAME}:${GATEWAY_PORT}${path}" \
-    | tee "${output_file}"
-
+http_get_host() {
+  local port="$1" sni="$2" path="$3" output="$4"
+  curl --noproxy '*' --fail-with-body --silent --show-error \
+    --connect-timeout 10 --max-time 30 \
+    --resolve "${sni}:${port}:127.0.0.1" --cacert "$CA_HOST" \
+    "https://${sni}:${port}${path}" | tee "$output"
   printf '\n'
 }
 
-run_http_transfer() {
-  local output_file="$1"
-
-  log "Submitting demo transfer through the gateway"
-
-  curl \
-    --fail-with-body \
-    --silent \
-    --show-error \
-    --connect-timeout 10 \
-    --max-time 30 \
-    --resolve "${GATEWAY_HOSTNAME}:${GATEWAY_PORT}:127.0.0.1" \
-    --cacert "${CA_FILE_HOST}" \
-    -H 'Content-Type: application/json' \
-    -d '{"from":"demo-001","to":"demo-002","amount":"100.00","currency":"CNY"}' \
-    "https://${GATEWAY_HOSTNAME}:${GATEWAY_PORT}/api/transfer" \
-    | tee "${output_file}"
-
-  printf '\n'
+http_with_openssl() {
+  local port="$1" sni="$2" group="$3" path="$4" output="$5"
+  set +e
+  printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$sni" | \
+    timeout 20s docker compose exec -T "$GATEWAY_SERVICE" \
+      "$OPENSSL_BIN" s_client -quiet -connect "localhost:${port}" -servername "$sni" \
+      -tls1_3 -groups "$group" -CAfile "$CA_CONTAINER" -verify_return_error \
+      >"$output" 2>&1
+  set -e
+  grep -q '200 OK' "$output" || { cat "$output"; die "HTTP request failed for ${sni}:${port} group=${group}"; }
 }
 
-run_benchmark() {
-  local group="$1"
-  local container_output="$2"
-  local host_output="$3"
-
-  log "Benchmarking ${group} with ${BENCH_COUNT} handshakes"
-
-  docker compose exec -T "${GATEWAY_SERVICE}" \
+benchmark() {
+  local port="$1" sni="$2" group="$3" container_out="$4" host_out="$5"
+  log "Benchmark: ${sni}:${port} group=${group} count=${BENCH_COUNT}"
+  docker compose exec -T "$GATEWAY_SERVICE" \
     python3 /workspace/scripts/bench_handshake.py \
-    --host "${GATEWAY_SERVICE}" \
-    --port "${GATEWAY_PORT}" \
-    --sni "${GATEWAY_HOSTNAME}" \
-    --groups "${group}" \
-    --openssl "${OPENSSL_BIN}" \
-    --cafile "${CA_FILE_CONTAINER}" \
-    --count "${BENCH_COUNT}" \
-    --out "${container_output}"
-
-  docker compose cp \
-    "${GATEWAY_SERVICE}:${container_output}" \
-    "${host_output}"
+      --host localhost --port "$port" --sni "$sni" --groups "$group" \
+      --openssl "$OPENSSL_BIN" --cafile "$CA_CONTAINER" --count "$BENCH_COUNT" \
+      --out "$container_out"
+  docker cp "${GATEWAY_CONTAINER}:${container_out}" "$host_out"
 }
 
 write_summary() {
-  local summary_file="${RESULT_DIR}/SUMMARY.md"
+  python3 - "$RESULT_DIR" "$BENCH_COUNT" <<'PY'
+import json, sys
+from pathlib import Path
+root=Path(sys.argv[1]); count=sys.argv[2]
+def load(name):
+    p=root/name
+    return json.loads(p.read_text()) if p.exists() else {}
+static=load('crypto-inventory.json').get('summary', {})
+tls=load('tls-inventory.json').get('summary', {})
+risk=load('risk-report.json').get('summary', {})
+verify=load('migration-verification.json').get('summary', {})
+fallback=load('fallback-report.json').get('summary', {})
+db=load('inventory-db-summary.json')
+text=f'''# PQC Migration Gateway v2 Experiment Summary
 
-  cat >"${summary_file}" <<EOF
-# PQC Migration Gateway Experiment Summary
+## Result
 
-- Generated at: ${TIMESTAMP}
-- TLS policy: \`${EXPECTED_TLS_GROUPS}\`
-- Benchmark repetitions: ${BENCH_COUNT}
+- Multi-service configuration: validated
+- Compatibility endpoint: Hybrid/PQC and X25519 both accepted
+- Strict endpoint: Hybrid/PQC accepted and X25519 rejected
+- Transparent reverse proxy: validated with protocol-neutral service endpoints
+- Static cryptographic inventory: completed
+- Online TLS inventory: completed
+- Risk assessment and SQLite import: completed
+- Migration policy verification: {verify.get("passed", 0)}/{verify.get("services", 0)} passed
+- Handshake benchmark repetitions per group: {count}
 
-## Validated functions
+## Inventory
 
-- Docker services started successfully.
-- Backend health check passed.
-- Gateway remained running.
-- TLS 1.3 Hybrid handshake succeeded with \`X25519MLKEM768\`.
-- TLS 1.3 classical fallback succeeded with \`X25519\`.
-- HTTPS reverse-proxy health endpoint succeeded.
-- Demo balance endpoint succeeded.
-- Demo transfer endpoint succeeded.
-- Static cryptographic inventory completed.
-- Handshake benchmark completed for both groups.
+- Concrete assets: {static.get("concrete_assets", 0)}
+- Source/configuration evidence: {static.get("source_evidence", 0)}
+- Online endpoints: {tls.get("endpoints", 0)}
+- PQC-capable endpoints: {tls.get("pqc_supported", 0)}
+- Risk findings: {risk.get("total", 0)}
+- SQLite assets/endpoints: {db.get("assets", 0)}/{db.get("endpoints", 0)}
 
-## Result files
+## Runtime migration metrics
 
-- \`docker-compose-ps.txt\`
-- \`openssl-version.txt\`
-- \`nginx-build.txt\`
-- \`tls-hybrid.txt\`
-- \`tls-x25519.txt\`
-- \`healthz.txt\`
-- \`balance.json\`
-- \`transfer.json\`
-- \`crypto-inventory.json\`
-- \`crypto-inventory.csv\`
-- \`handshake-hybrid.json\`
-- \`handshake-x25519.json\`
-- \`gateway-logs.txt\`
-EOF
+- Recorded requests: {fallback.get("connections", 0)}
+- Hybrid/PQC requests: {fallback.get("hybrid_pqc", 0)}
+- Classical fallback requests: {fallback.get("classical_fallback", 0)}
+- Hybrid adoption rate: {fallback.get("hybrid_adoption_rate")}
+
+## Files
+
+- `crypto-inventory.json` / `.csv`
+- `tls-inventory.json` / `.csv`
+- `risk-report.json`
+- `inventory.db`
+- `migration-verification.json`
+- `fallback-report.json`
+- `handshake-hybrid.json`
+- `handshake-x25519.json`
+- `gateway-access.log`
+- TLS transcript files
+'''
+(root/'SUMMARY.md').write_text(text)
+PY
 }
 
 main() {
-  require_command docker
-  require_command curl
-  require_command python3
-  require_file docker-compose.yml
-  require_file "${CA_FILE_HOST}"
-  require_file scripts/crypto_inventory.py
+  require docker
+  require curl
+  require python3
+  require timeout
+  [[ -f config/services.json ]] || die 'config/services.json not found'
 
-  docker compose version >/dev/null
+  log 'Validating multi-service configuration'
+  python3 scripts/render_gateway_config.py --config config/services.json --output "$RESULT_DIR/rendered-nginx.conf" --check
 
-  local configured_groups
-  configured_groups="$(
-    docker compose config |
-      awk '$1 == "TLS_GROUPS:" {gsub(/"/, "", $2); print $2; exit}'
-  )"
+  log 'Generating fresh demo certificates with all configured DNS names'
+  ./certs/gen-classic-demo-certs.sh ./certs
 
-  [[ "${configured_groups}" == "${EXPECTED_TLS_GROUPS}" ]] \
-    || die "TLS_GROUPS must remain ${EXPECTED_TLS_GROUPS}; current value: ${configured_groups:-<empty>}"
+  if [[ "$BUILD" == "1" ]] || [[ -z "$(docker compose images -q "$GATEWAY_SERVICE" 2>/dev/null)" ]]; then
+    log 'Building gateway image'
+    docker compose build "$GATEWAY_SERVICE"
+  else
+    log 'Using existing gateway image; set BUILD=1 to rebuild'
+  fi
 
-  log "TLS policy verified: ${configured_groups}"
-  log "Starting existing images without rebuilding"
+  docker compose up -d --force-recreate
+  wait_container "$BACKEND_CONTAINER" healthy
+  wait_container "$GATEWAY_CONTAINER" healthy
+  docker compose ps | tee "$RESULT_DIR/docker-compose-ps.txt"
 
-  docker compose up -d --no-build
-  wait_for_backend_health
-  wait_for_gateway_running
+  docker compose exec -T "$GATEWAY_SERVICE" "$OPENSSL_BIN" version -a >"$RESULT_DIR/openssl-version.txt" 2>&1
+  docker compose exec -T "$GATEWAY_SERVICE" /opt/nginx/sbin/nginx -V >"$RESULT_DIR/nginx-build.txt" 2>&1
+  docker compose exec -T "$GATEWAY_SERVICE" sh -c ': > /var/log/nginx/access.log'
 
-  docker compose ps | tee "${RESULT_DIR}/docker-compose-ps.txt"
+  handshake_success 8443 bank-gateway.local X25519MLKEM768 "$RESULT_DIR/tls-compat-hybrid.txt"
+  handshake_success 8443 bank-gateway.local X25519 "$RESULT_DIR/tls-compat-x25519.txt"
+  handshake_success 9443 strict-gateway.local X25519MLKEM768 "$RESULT_DIR/tls-strict-hybrid.txt"
+  handshake_expected_failure 9443 strict-gateway.local X25519 "$RESULT_DIR/tls-strict-x25519-rejected.txt"
 
-  log "Recording OpenSSL and NGINX build information"
+  log 'Testing transparent HTTP reverse proxy without host proxy variables'
+  http_get_host 8443 bank-gateway.local /service-info "$RESULT_DIR/service-info-compat.json"
+  http_with_openssl 8443 bank-gateway.local X25519MLKEM768 /service-info "$RESULT_DIR/http-hybrid.txt"
+  http_with_openssl 8443 bank-gateway.local X25519 /service-info "$RESULT_DIR/http-x25519.txt"
+  http_with_openssl 9443 strict-gateway.local X25519MLKEM768 /service-info "$RESULT_DIR/http-strict-hybrid.txt"
 
-  docker compose exec -T "${GATEWAY_SERVICE}" \
-    "${OPENSSL_BIN}" version -a \
-    >"${RESULT_DIR}/openssl-version.txt" 2>&1
-
-  docker compose exec -T "${GATEWAY_SERVICE}" \
-    /opt/nginx/sbin/nginx -V \
-    >"${RESULT_DIR}/nginx-build.txt" 2>&1
-
-  run_handshake \
-    "X25519MLKEM768" \
-    "${RESULT_DIR}/tls-hybrid.txt" \
-    'Negotiated TLS1\.3 group: X25519MLKEM768|Server Temp Key: X25519MLKEM768|Peer Temp Key: X25519MLKEM768'
-
-  run_handshake \
-    "X25519" \
-    "${RESULT_DIR}/tls-x25519.txt" \
-    'Negotiated TLS1\.3 group: X25519([^A-Za-z0-9]|$)|Peer Temp Key: X25519([^A-Za-z0-9]|$)'
-
-  run_http_get "/healthz" "${RESULT_DIR}/healthz.txt"
-  run_http_get "/api/balance" "${RESULT_DIR}/balance.json"
-  run_http_transfer "${RESULT_DIR}/transfer.json"
-
-  log "Running static cryptographic inventory"
-
+  log 'Running static cryptographic inventory v2'
   python3 scripts/crypto_inventory.py \
-    --root ./certs \
-    --root ./gateway \
-    --root ./docker-compose.yml \
-    --out-json "${RESULT_DIR}/crypto-inventory.json" \
-    --out-csv "${RESULT_DIR}/crypto-inventory.csv"
+    --root ./certs --root ./gateway --root ./config --root ./docker-compose.yml \
+    --root ./scripts --root ./scanner --root ./manager \
+    --out-json "$RESULT_DIR/crypto-inventory.json" \
+    --out-csv "$RESULT_DIR/crypto-inventory.csv"
 
-  run_benchmark \
-    "X25519MLKEM768" \
-    "/tmp/handshake-hybrid.json" \
-    "${RESULT_DIR}/handshake-hybrid.json"
+  log 'Running online TLS inventory with OpenSSL 3.5 inside the gateway container'
+  docker compose exec -T "$GATEWAY_SERVICE" \
+    python3 /workspace/scanner/tls_scanner.py \
+      --endpoint 'localhost:8443,bank-gateway.local' \
+      --endpoint 'localhost:9443,strict-gateway.local' \
+      --groups X25519MLKEM768:X25519 \
+      --openssl "$OPENSSL_BIN" --cafile "$CA_CONTAINER" \
+      --out-json /tmp/tls-inventory.json --out-csv /tmp/tls-inventory.csv
+  docker cp "$GATEWAY_CONTAINER:/tmp/tls-inventory.json" "$RESULT_DIR/tls-inventory.json"
+  docker cp "$GATEWAY_CONTAINER:/tmp/tls-inventory.csv" "$RESULT_DIR/tls-inventory.csv"
 
-  run_benchmark \
-    "X25519" \
-    "/tmp/handshake-x25519.json" \
-    "${RESULT_DIR}/handshake-x25519.json"
+  python3 manager/risk_engine.py --static "$RESULT_DIR/crypto-inventory.json" --tls "$RESULT_DIR/tls-inventory.json" --out "$RESULT_DIR/risk-report.json"
+  python3 manager/inventory_db.py --db "$RESULT_DIR/inventory.db" --static "$RESULT_DIR/crypto-inventory.json" --tls "$RESULT_DIR/tls-inventory.json" --risk "$RESULT_DIR/risk-report.json" --summary-json "$RESULT_DIR/inventory-db-summary.json"
+  python3 manager/verify_migration.py --services config/services.json --tls "$RESULT_DIR/tls-inventory.json" --out "$RESULT_DIR/migration-verification.json"
 
-  docker compose logs --no-color --tail=300 "${GATEWAY_SERVICE}" \
-    >"${RESULT_DIR}/gateway-logs.txt"
+  docker compose exec -T "$GATEWAY_SERVICE" sh -c 'cat /var/log/nginx/access.log' > "$RESULT_DIR/gateway-access.log"
+  python3 manager/fallback_report.py --log "$RESULT_DIR/gateway-access.log" --out "$RESULT_DIR/fallback-report.json"
 
+  benchmark 8443 bank-gateway.local X25519MLKEM768 /tmp/handshake-hybrid.json "$RESULT_DIR/handshake-hybrid.json"
+  benchmark 8443 bank-gateway.local X25519 /tmp/handshake-x25519.json "$RESULT_DIR/handshake-x25519.json"
+
+  docker compose logs --no-color --tail=300 "$GATEWAY_SERVICE" > "$RESULT_DIR/gateway-container.log"
   write_summary
-
-  log "All experiments completed successfully"
-  log "Results directory: ${RESULT_DIR}"
-  printf '\nOpen the summary:\n  %s\n' "${RESULT_DIR}/SUMMARY.md"
+  log "All v2 experiments completed: $RESULT_DIR"
 }
 
 main "$@"

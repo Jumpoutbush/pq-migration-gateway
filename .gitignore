@@ -3,19 +3,20 @@ certs/*.key
 certs/*.crt
 certs/*.csr
 certs/*.srl
+certs/*.ext
 certs/mldsa-demo/
 
-# Generated scan/benchmark output.
+# Generated scans, databases, and experiments.
 crypto-inventory.json
 crypto-inventory.csv
-tls-probe.json
-handshake-bench.json
+tls-inventory.json
+tls-inventory.csv
+risk-report.json
+*.db
+experiment-results/
 
-# Local editor/runtime.
+# Runtime/editor.
 .env
 __pycache__/
 *.pyc
 .DS_Store
-
-# Experiment outputs
-experiment-results/

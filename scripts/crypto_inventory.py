@@ -1,80 +1,171 @@
 #!/usr/bin/env python3
-"""Cryptographic asset inventory scanner for PQC migration planning.
+"""Dependency-light static cryptographic asset inventory scanner.
 
-The scanner is intentionally dependency-light: it uses Python stdlib plus the
-OpenSSL CLI available on the host/container. It does not implement cryptography;
-it discovers where cryptography is configured or embedded.
+Version 2 separates concrete assets from source/configuration evidence, assigns
+stable IDs, recognises RSA private keys, and never stores private-key material.
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
+import hashlib
 import json
-import os
 import re
 import subprocess
-import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 CERT_EXTS = {".crt", ".cer", ".pem"}
 KEY_EXTS = {".key", ".pem"}
-TEXT_EXTS = {
-    ".conf", ".cnf", ".cfg", ".ini", ".yaml", ".yml", ".json", ".properties",
-    ".xml", ".txt", ".md", ".sh", ".py", ".go", ".java", ".js", ".ts", ".rs",
-}
+TEXT_EXTS = {".conf", ".cnf", ".cfg", ".ini", ".yaml", ".yml", ".json", ".properties", ".xml", ".txt", ".md", ".sh", ".py", ".go", ".java", ".js", ".ts", ".rs"}
 
-CRYPTO_PATTERNS = [
+# Order matters: PQC/hybrid must be recognised before generic DSA/ECDH tokens.
+PATTERNS = [
+    ("hybrid_kex", re.compile(r"X25519MLKEM768|SecP256r1MLKEM768|SecP384r1MLKEM1024", re.I)),
+    ("pqc", re.compile(r"ML-?KEM|ML-?DSA|SLH-?DSA|Dilithium|Kyber|SPHINCS|Falcon|HQC|Frodo", re.I)),
     ("rsa", re.compile(r"\bRSA\b|rsa_keygen_bits|RSAPrivateKey", re.I)),
-    ("dsa", re.compile(r"\bDSA\b|DSAPrivateKey", re.I)),
-    ("ecdsa_ecdh", re.compile(r"\bECDSA\b|\bECDH\b|\bECC\b|prime256v1|secp(256|384|521)r1|X25519|X448", re.I)),
+    ("dsa", re.compile(r"(?<!ML-)\bDSA\b|DSAPrivateKey", re.I)),
+    ("ecdsa_ecdh", re.compile(r"\bECDSA\b|\bECDH\b|\bECC\b|prime256v1|secp(?:256|384|521)r1|\bX25519\b|\bX448\b", re.I)),
     ("finite_field_dh", re.compile(r"\bDHE\b|ffdhe|Diffie-Hellman|dhparam", re.I)),
     ("weak_hash", re.compile(r"\bSHA1\b|sha1WithRSA|md5WithRSA|\bMD5\b", re.I)),
-    ("tls_config", re.compile(r"ssl_protocols|ssl_ciphers|ssl_ecdh_curve|ssl_conf_command\s+Groups|SSLCipherSuite|TLS_GROUPS", re.I)),
-    ("pqc", re.compile(r"ML-?KEM|ML-?DSA|SLH-?DSA|Dilithium|Kyber|SPHINCS|Falcon|X25519MLKEM768", re.I)),
+    ("tls_config", re.compile(r"ssl_protocols|ssl_ciphers|ssl_ecdh_curve|ssl_conf_command\s+Groups|SSLCipherSuite|TLS_GROUPS|tls_groups", re.I)),
 ]
 
-VULN_PUBLIC_KEY = re.compile(r"RSA|ECDSA|ECDH|DSA|Diffie-Hellman|id-ecPublicKey", re.I)
-PQC_PUBLIC_KEY = re.compile(r"ML-?DSA|SLH-?DSA|ML-?KEM|Dilithium|SPHINCS|Falcon", re.I)
+VULNERABLE = re.compile(r"RSA|ECDSA|ECDH|DSA|Diffie-Hellman|id-ecPublicKey", re.I)
+PQC = re.compile(r"ML-?DSA|SLH-?DSA|ML-?KEM|Dilithium|SPHINCS|Falcon|HQC|Frodo", re.I)
 WEAK_HASH = re.compile(r"sha1|md5", re.I)
 
 
 @dataclass
-class Finding:
+class Asset:
+    asset_id: str
+    asset_type: str
     path: str
-    finding_type: str
-    algorithm: str = ""
+    algorithm: str
     key_bits: str = ""
     subject: str = ""
     issuer: str = ""
     not_before: str = ""
     not_after: str = ""
-    line: int | None = None
-    evidence: str = ""
+    fingerprint: str = ""
+    deployment_status: str = "present"
     risk: str = "INFO"
     pq_status: str = "unknown"
     recommendation: str = ""
     metadata: dict = field(default_factory=dict)
 
 
-def run_cmd(cmd: list[str], input_data: bytes | None = None, timeout: int = 8) -> tuple[int, str, str]:
+@dataclass
+class Evidence:
+    evidence_id: str
+    path: str
+    line: int
+    evidence_type: str
+    algorithm: str
+    excerpt: str
+    deployment_status: str = "source_reference"
+    risk: str = "INFO"
+    pq_status: str = "unknown"
+    recommendation: str = ""
+
+
+def stable_id(prefix: str, *parts: object) -> str:
+    blob = "\x1f".join(str(p) for p in parts)
+    return f"{prefix}-" + hashlib.sha256(blob.encode()).hexdigest()[:20]
+
+
+def run(cmd: list[str], timeout: int = 8) -> tuple[int, str]:
     try:
-        proc = subprocess.run(
-            cmd,
-            input=input_data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        return 124, "", str(exc)
-    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 124, str(exc)
+    return proc.returncode, (proc.stdout + b"\n" + proc.stderr).decode("utf-8", "replace")
 
 
-def safe_read_text(path: Path, max_bytes: int) -> str | None:
+def first(pattern: str, text: str) -> str:
+    found = re.search(pattern, text, re.I | re.M)
+    return found.group(1).strip() if found else ""
+
+
+def classify(algorithm: str, evidence: str, key_bits: str = "") -> tuple[str, str, str]:
+    blob = f"{algorithm} {evidence}"
+    if WEAK_HASH.search(blob):
+        return "HIGH", "classically_weak", "Remove MD5/SHA-1 and reissue certificates or update signatures."
+    if PQC.search(blob) or "hybrid_kex" in algorithm:
+        return "LOW", "pqc_or_pqc_candidate", "Confirm interoperability and the intended migration policy."
+    if VULNERABLE.search(blob):
+        if algorithm.upper().startswith("RSA") and key_bits.isdigit() and int(key_bits) < 2048:
+            return "CRITICAL", "classically_weak_and_quantum_vulnerable", "Replace weak RSA immediately and plan hybrid/PQC migration."
+        return "MEDIUM", "quantum_vulnerable", "Associate the asset with its service and migrate to hybrid/PQC where supported."
+    return "INFO", "unknown", "Review manually if this component protects long-lived or high-value data."
+
+
+def parse_certificate(path: Path, openssl: str) -> Asset | None:
+    rc, text = run([openssl, "x509", "-in", str(path), "-noout", "-subject", "-issuer", "-dates", "-fingerprint", "-sha256", "-text"])
+    if rc != 0:
+        return None
+    pub = first(r"Public Key Algorithm:\s*([^\n]+)", text)
+    sig = first(r"Signature Algorithm:\s*([^\n]+)", text)
+    bits = first(r"Public-Key:\s*\((\d+)\s+bit", text)
+    algorithm = "; ".join(x for x in [pub, sig] if x)
+    risk, status, recommendation = classify(algorithm, text, bits)
+    fingerprint = first(r"SHA256 Fingerprint=(.*)$", text)
+    return Asset(
+        asset_id=stable_id("asset", "x509", fingerprint or path.resolve()),
+        asset_type="x509_certificate",
+        path=str(path.resolve()),
+        algorithm=algorithm,
+        key_bits=bits,
+        subject=first(r"^subject=(.*)$", text),
+        issuer=first(r"^issuer=(.*)$", text),
+        not_before=first(r"^notBefore=(.*)$", text),
+        not_after=first(r"^notAfter=(.*)$", text),
+        fingerprint=fingerprint,
+        risk=risk,
+        pq_status=status,
+        recommendation=recommendation,
+    )
+
+
+def identify_private_key(path: Path, openssl: str) -> Asset | None:
+    # Validation uses algorithm-specific parsers but never persists key text.
+    algorithm = ""
+    bits = ""
+    if run([openssl, "rsa", "-in", str(path), "-check", "-noout"])[0] == 0:
+        algorithm = "RSA"
+        rc, text = run([openssl, "pkey", "-in", str(path), "-noout", "-text_pub"])
+        bits = first(r"Public-Key:\s*\((\d+)\s+bit", text) if rc == 0 else ""
+    elif run([openssl, "ec", "-in", str(path), "-check", "-noout"])[0] == 0:
+        algorithm = "EC"
+        rc, text = run([openssl, "pkey", "-in", str(path), "-noout", "-text_pub"])
+        bits = first(r"Private-Key:\s*\((\d+)\s+bit", text) if rc == 0 else ""
+    else:
+        rc, text = run([openssl, "pkey", "-in", str(path), "-noout", "-text_pub"])
+        if rc != 0:
+            return None
+        if re.search(r"ML-?DSA", text, re.I):
+            algorithm = "ML-DSA"
+        elif re.search(r"SLH-?DSA", text, re.I):
+            algorithm = "SLH-DSA"
+        else:
+            algorithm = "private_key_unknown"
+        bits = first(r"(?:Public|Private)-Key:\s*\((\d+)\s+bit", text)
+    risk, status, recommendation = classify(algorithm, "", bits)
+    return Asset(
+        asset_id=stable_id("asset", "private-key", path.resolve()),
+        asset_type="private_key",
+        path=str(path.resolve()),
+        algorithm=algorithm,
+        key_bits=bits,
+        risk=risk,
+        pq_status=status,
+        recommendation=recommendation,
+        metadata={"evidence": f"Private key parsed successfully; algorithm={algorithm}; bits={bits or 'unknown'}"},
+    )
+
+
+def safe_text(path: Path, max_bytes: int) -> str | None:
     try:
         if path.stat().st_size > max_bytes:
             return None
@@ -86,183 +177,104 @@ def safe_read_text(path: Path, max_bytes: int) -> str | None:
     return raw.decode("utf-8", "replace")
 
 
-def parse_date(value: str) -> str:
-    # OpenSSL emits e.g. notAfter=Jul  7 12:00:00 2027 GMT.
-    return value.strip()
-
-
-def classify(algorithm: str, evidence: str, key_bits: str = "") -> tuple[str, str, str]:
-    blob = f"{algorithm} {evidence}"
-    if PQC_PUBLIC_KEY.search(blob):
-        return "LOW", "pqc_or_pqc_candidate", "Confirm implementation profile, certificate-chain interoperability, and operational policy."
-    if WEAK_HASH.search(blob):
-        return "HIGH", "classically_weak", "Remove MD5/SHA-1 and reissue certificates or update signatures."
-    if VULN_PUBLIC_KEY.search(blob):
-        if key_bits and key_bits.isdigit() and int(key_bits) < 2048 and "RSA" in blob.upper():
-            return "CRITICAL", "classically_weak_and_quantum_vulnerable", "Replace weak RSA and plan hybrid/PQC migration immediately."
-        return "MEDIUM", "quantum_vulnerable", "Inventory owner, protocol, and data lifetime; migrate to hybrid/PQC where supported."
-    return "INFO", "unknown", "Review manually if this component protects long-lived confidential or high-value data."
-
-
-def parse_cert(path: Path, openssl_bin: str) -> list[Finding]:
-    rc, out, err = run_cmd([openssl_bin, "x509", "-in", str(path), "-noout", "-text", "-subject", "-issuer", "-dates"])
-    if rc != 0:
-        return []
-
-    sig = re.search(r"Signature Algorithm:\s*([^\n]+)", out)
-    pub = re.search(r"Public Key Algorithm:\s*([^\n]+)", out)
-    bits = re.search(r"Public-Key:\s*\((\d+)\s+bit\)", out)
-    subj = re.search(r"subject=([^\n]+)", out)
-    issuer = re.search(r"issuer=([^\n]+)", out)
-    nb = re.search(r"notBefore=([^\n]+)", out)
-    na = re.search(r"notAfter=([^\n]+)", out)
-
-    algorithm = "; ".join(x for x in [(pub.group(1).strip() if pub else ""), (sig.group(1).strip() if sig else "")] if x)
-    risk, pq_status, rec = classify(algorithm, out, bits.group(1) if bits else "")
-    return [
-        Finding(
-            path=str(path),
-            finding_type="x509_certificate",
-            algorithm=algorithm,
-            key_bits=bits.group(1) if bits else "",
-            subject=subj.group(1).strip() if subj else "",
-            issuer=issuer.group(1).strip() if issuer else "",
-            not_before=parse_date(nb.group(1)) if nb else "",
-            not_after=parse_date(na.group(1)) if na else "",
-            risk=risk,
-            pq_status=pq_status,
-            recommendation=rec,
-        )
-    ]
-
-
-def parse_private_key(path: Path, openssl_bin: str) -> list[Finding]:
-    rc, out, err = run_cmd([openssl_bin, "pkey", "-in", str(path), "-noout", "-text"], timeout=5)
-    if rc != 0:
-        return []
-    first = "\n".join(out.splitlines()[:8])
-    alg = "private_key"
-    if re.search(r"RSA", out, re.I):
-        alg = "RSA private key"
-    elif re.search(r"EC PRIVATE|ASN1 OID|prime256v1|secp|X25519", out, re.I):
-        alg = "EC private key"
-    elif re.search(r"ML-?DSA|SLH-?DSA", out, re.I):
-        alg = "PQC private key"
-    bits = re.search(r"Private-Key:\s*\((\d+)\s+bit", out)
-    risk, pq_status, rec = classify(alg, out, bits.group(1) if bits else "")
-    return [
-        Finding(
-            path=str(path),
-            finding_type="private_key",
-            algorithm=alg,
-            key_bits=bits.group(1) if bits else "",
-            evidence=first,
-            risk=risk,
-            pq_status=pq_status,
-            recommendation=rec,
-        )
-    ]
-
-
-def scan_text(path: Path, max_bytes: int) -> list[Finding]:
-    text = safe_read_text(path, max_bytes)
+def scan_text(path: Path, max_bytes: int) -> list[Evidence]:
+    text = safe_text(path, max_bytes)
     if text is None:
         return []
-    findings: list[Finding] = []
-    for idx, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        for name, pattern in CRYPTO_PATTERNS:
-            if pattern.search(stripped):
-                risk, pq_status, rec = classify(name, stripped)
-                findings.append(
-                    Finding(
-                        path=str(path),
-                        finding_type="text_crypto_reference",
-                        algorithm=name,
-                        line=idx,
-                        evidence=stripped[:400],
-                        risk=risk,
-                        pq_status=pq_status,
-                        recommendation=rec,
-                    )
-                )
-                break
-    return findings
+    output: list[Evidence] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        matched_pqc = False
+        for algorithm, pattern in PATTERNS:
+            if algorithm == "dsa" and matched_pqc:
+                continue
+            if not pattern.search(line):
+                continue
+            matched_pqc = matched_pqc or algorithm in {"pqc", "hybrid_kex"}
+            excerpt = line.strip()[:500]
+            risk, status, recommendation = classify(algorithm, excerpt)
+            output.append(Evidence(
+                evidence_id=stable_id("evidence", path.resolve(), number, algorithm, excerpt),
+                path=str(path.resolve()), line=number, evidence_type="text_crypto_reference",
+                algorithm=algorithm, excerpt=excerpt, risk=risk, pq_status=status,
+                recommendation=recommendation,
+            ))
+    return output
 
 
-def iter_files(roots: Iterable[Path], exclude_dirs: set[str]) -> Iterable[Path]:
+def iter_files(roots: list[Path]):
+    seen: set[Path] = set()
     for root in roots:
         if root.is_file():
-            yield root
+            candidates = [root]
+        elif root.is_dir():
+            candidates = (p for p in root.rglob("*") if p.is_file())
+        else:
             continue
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in exclude_dirs and not d.startswith(".git")]
-            for name in filenames:
-                yield Path(dirpath) / name
-
-
-def write_csv(path: Path, findings: list[Finding]) -> None:
-    fieldnames = [
-        "path", "finding_type", "algorithm", "key_bits", "subject", "issuer", "not_before", "not_after",
-        "line", "evidence", "risk", "pq_status", "recommendation",
-    ]
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for finding in findings:
-            row = asdict(finding)
-            row.pop("metadata", None)
-            writer.writerow(row)
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                yield path
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a cryptographic asset inventory for PQC migration.")
-    parser.add_argument("--root", action="append", required=True, help="File or directory to scan. Can be repeated.")
-    parser.add_argument("--openssl", default="openssl", help="OpenSSL CLI path. Use /opt/openssl/bin/openssl in the gateway container.")
-    parser.add_argument("--out-json", default="crypto-inventory.json")
-    parser.add_argument("--out-csv", default="crypto-inventory.csv")
-    parser.add_argument("--max-bytes", type=int, default=2_000_000, help="Max text file size to scan.")
-    parser.add_argument("--exclude-dir", action="append", default=["node_modules", "vendor", "target", "build", "dist", "__pycache__"])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", action="append", required=True)
+    parser.add_argument("--openssl", default="openssl")
+    parser.add_argument("--max-text-bytes", type=int, default=2_000_000)
+    parser.add_argument("--out-json", required=True)
+    parser.add_argument("--out-csv", required=True)
     args = parser.parse_args()
 
-    roots = [Path(r).expanduser().resolve() for r in args.root]
-    findings: list[Finding] = []
-    seen: set[tuple[str, str, str, int | None]] = set()
-
-    for file_path in iter_files(roots, set(args.exclude_dir)):
-        suffix = file_path.suffix.lower()
-        file_findings: list[Finding] = []
+    roots = [Path(x) for x in args.root]
+    assets: dict[str, Asset] = {}
+    evidence: dict[str, Evidence] = {}
+    for path in iter_files(roots):
+        suffix = path.suffix.lower()
         if suffix in CERT_EXTS:
-            file_findings.extend(parse_cert(file_path, args.openssl))
+            cert = parse_certificate(path, args.openssl)
+            if cert:
+                assets[cert.asset_id] = cert
         if suffix in KEY_EXTS:
-            file_findings.extend(parse_private_key(file_path, args.openssl))
-        if suffix in TEXT_EXTS or suffix in CERT_EXTS or suffix in KEY_EXTS:
-            file_findings.extend(scan_text(file_path, args.max_bytes))
-        for finding in file_findings:
-            key = (finding.path, finding.finding_type, finding.evidence or finding.algorithm, finding.line)
-            if key not in seen:
-                seen.add(key)
-                findings.append(finding)
+            key = identify_private_key(path, args.openssl)
+            if key:
+                assets[key.asset_id] = key
+        if suffix in TEXT_EXTS or path.name in {"Dockerfile", "Makefile"}:
+            for item in scan_text(path, args.max_text_bytes):
+                evidence[item.evidence_id] = item
 
+    asset_rows = [asdict(x) for x in sorted(assets.values(), key=lambda x: (x.asset_type, x.path))]
+    evidence_rows = [asdict(x) for x in sorted(evidence.values(), key=lambda x: (x.path, x.line, x.algorithm))]
+    risks = [x["risk"] for x in asset_rows + evidence_rows]
     payload = {
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "roots": [str(r) for r in roots],
+        "schema_version": 2,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "roots": [str(p.resolve()) for p in roots],
         "summary": {
-            "total_findings": len(findings),
-            "by_risk": {risk: sum(1 for f in findings if f.risk == risk) for risk in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]},
-            "quantum_vulnerable": sum(1 for f in findings if "quantum_vulnerable" in f.pq_status),
-            "pqc_or_candidates": sum(1 for f in findings if f.pq_status == "pqc_or_pqc_candidate"),
+            "concrete_assets": len(asset_rows),
+            "source_evidence": len(evidence_rows),
+            "by_risk": {name: risks.count(name) for name in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]},
+            "quantum_vulnerable_assets": sum(x["pq_status"] == "quantum_vulnerable" for x in asset_rows),
+            "pqc_assets_or_references": sum(x["pq_status"] == "pqc_or_pqc_candidate" for x in asset_rows + evidence_rows),
         },
-        "findings": [asdict(f) for f in findings],
+        "assets": asset_rows,
+        "evidence": evidence_rows,
+        # Compatibility field for tools that consumed v1 findings.
+        "findings": asset_rows + evidence_rows,
     }
-
-    Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_csv(Path(args.out_csv), findings)
-
+    Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with Path(args.out_csv).open("w", encoding="utf-8", newline="") as handle:
+        fields = ["record_kind", "id", "path", "type", "algorithm", "key_bits", "line", "deployment_status", "risk", "pq_status", "recommendation", "excerpt"]
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for item in asset_rows:
+            writer.writerow({"record_kind": "asset", "id": item["asset_id"], "path": item["path"], "type": item["asset_type"], "algorithm": item["algorithm"], "key_bits": item["key_bits"], "line": "", "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item.get("metadata", {}).get("evidence", "")})
+        for item in evidence_rows:
+            writer.writerow({"record_kind": "evidence", "id": item["evidence_id"], "path": item["path"], "type": item["evidence_type"], "algorithm": item["algorithm"], "key_bits": "", "line": item["line"], "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item["excerpt"]})
     print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
-    print(f"Wrote {args.out_json} and {args.out_csv}")
     return 0
 
 

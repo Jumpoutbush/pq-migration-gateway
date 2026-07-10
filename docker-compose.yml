@@ -10,41 +10,43 @@ services:
       - "8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
-      interval: 10s
+      interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   pq-gateway:
+    image: pq-migration-gateway-pq-gateway:2.0
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
+      network: host
       args:
         OPENSSL_VERSION: "3.5.0"
         NGINX_VERSION: "1.28.0"
         MAKE_JOBS: "4"
+        HTTP_PROXY: "${HTTP_PROXY:-}"
+        HTTPS_PROXY: "${HTTPS_PROXY:-}"
+        http_proxy: "${HTTP_PROXY:-}"
+        https_proxy: "${HTTPS_PROXY:-}"
+        NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1}"
+        no_proxy: "${no_proxy:-localhost,127.0.0.1,::1}"
     container_name: pq-gateway
     depends_on:
       bank-backend:
         condition: service_healthy
     ports:
       - "8443:8443"
+      - "9443:9443"
     environment:
-      GATEWAY_LISTEN_PORT: "8443"
-      GATEWAY_SERVER_NAME: "bank-gateway.local"
-      GATEWAY_CERT: "/etc/pq-gateway/certs/server.crt"
-      GATEWAY_KEY: "/etc/pq-gateway/certs/server.key"
-      # Migration default: hybrid PQ first, classical fallback for legacy clients.
-      # Strict PQC/hybrid-only test: set this to X25519MLKEM768.
-      TLS_GROUPS: "X25519MLKEM768:X25519" #:X25519
-      UPSTREAM_URL: "http://bank-backend:8080"
-      UPSTREAM_TLS_VERIFY: "off"
-      # off | optional | required
-      CLIENT_AUTH: "off"
-      CLIENT_CA: "/etc/pq-gateway/certs/ca.crt"
-      DNS_RESOLVER: "127.0.0.11"
-      UPSTREAM_CONNECT_TIMEOUT: "5s"
-      UPSTREAM_SEND_TIMEOUT: "60s"
-      UPSTREAM_READ_TIMEOUT: "60s"
+      SERVICES_CONFIG: "/etc/pq-gateway/config/services.json"
     volumes:
       - ./certs:/etc/pq-gateway/certs:ro
+      - ./config:/etc/pq-gateway/config:ro
       - ./scripts:/workspace/scripts:ro
+      - ./scanner:/workspace/scanner:ro
+      - ./manager:/workspace/manager:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl --noproxy '*' -fsS --resolve bank-gateway.local:8443:127.0.0.1 --cacert /etc/pq-gateway/certs/ca.crt https://bank-gateway.local:8443/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

@@ -3,7 +3,8 @@ set -euo pipefail
 
 OUT_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 SERVER_NAME="${SERVER_NAME:-bank-gateway.local}"
-CLIENT_NAME="${CLIENT_NAME:-bank-client.local}"
+SERVER_ALT_NAMES="${SERVER_ALT_NAMES:-DNS:strict-gateway.local,DNS:gateway.local,DNS:localhost,IP:127.0.0.1}"
+CLIENT_NAME="${CLIENT_NAME:-gateway-client.local}"
 DAYS="${DAYS:-825}"
 OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 
@@ -14,7 +15,7 @@ cat > server.ext <<EOF
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=DNS:${SERVER_NAME},DNS:localhost,IP:127.0.0.1
+subjectAltName=DNS:${SERVER_NAME},${SERVER_ALT_NAMES}
 EOF
 
 cat > client.ext <<EOF
@@ -26,17 +27,17 @@ EOF
 
 "$OPENSSL_BIN" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out ca.key
 "$OPENSSL_BIN" req -x509 -new -key ca.key -sha384 -days "$DAYS" -out ca.crt \
-  -subj "/C=CN/O=Demo Bank PQ Migration/CN=Demo Bank Migration CA"
+  -subj "/C=CN/O=PQC Migration Demo/CN=PQC Migration Demo CA"
 
 "$OPENSSL_BIN" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out server.key
 "$OPENSSL_BIN" req -new -key server.key -out server.csr \
-  -subj "/C=CN/O=Demo Bank PQ Migration/CN=${SERVER_NAME}"
+  -subj "/C=CN/O=PQC Migration Demo/CN=${SERVER_NAME}"
 "$OPENSSL_BIN" x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out server.crt -days "$DAYS" -sha384 -extfile server.ext
 
 "$OPENSSL_BIN" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out client.key
 "$OPENSSL_BIN" req -new -key client.key -out client.csr \
-  -subj "/C=CN/O=Demo Bank PQ Migration/CN=${CLIENT_NAME}"
+  -subj "/C=CN/O=PQC Migration Demo/CN=${CLIENT_NAME}"
 "$OPENSSL_BIN" x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out client.crt -days "$DAYS" -sha384 -extfile client.ext
 
@@ -48,4 +49,5 @@ Generated demo RSA-3072 certificate chain in: $OUT_DIR
   CA:      $OUT_DIR/ca.crt
   Server:  $OUT_DIR/server.crt / $OUT_DIR/server.key
   Client:  $OUT_DIR/client.crt / $OUT_DIR/client.key
+  SANs:    ${SERVER_NAME}, ${SERVER_ALT_NAMES}
 EOF

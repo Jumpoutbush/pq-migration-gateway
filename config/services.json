@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "defaults": {
+    "certificate": "/etc/pq-gateway/certs/server.crt",
+    "certificate_key": "/etc/pq-gateway/certs/server.key",
+    "client_ca": "/etc/pq-gateway/certs/ca.crt",
+    "upstream_ca": "/etc/pq-gateway/certs/upstream-ca.crt",
+    "dns_resolver": "127.0.0.11",
+    "connect_timeout": "5s",
+    "send_timeout": "60s",
+    "read_timeout": "60s"
+  },
+  "services": [
+    {
+      "name": "compatibility-gateway",
+      "listen_port": 8443,
+      "server_name": "bank-gateway.local",
+      "upstream_url": "http://bank-backend:8080",
+      "tls_groups": "X25519MLKEM768:X25519",
+      "client_auth": "off",
+      "upstream_tls_verify": "off"
+    },
+    {
+      "name": "strict-pqc-gateway",
+      "listen_port": 9443,
+      "server_name": "strict-gateway.local",
+      "upstream_url": "http://bank-backend:8080",
+      "tls_groups": "X25519MLKEM768",
+      "client_auth": "off",
+      "upstream_tls_verify": "off"
+    }
+  ]
+}

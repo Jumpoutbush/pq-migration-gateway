@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  python-syntax:
+  syntax-and-tests:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -13,4 +13,13 @@ jobs:
         with:
           python-version: '3.12'
       - name: Python syntax check
-        run: python -m py_compile backend/bank_backend.py scripts/crypto_inventory.py scripts/tls_probe.py scripts/bench_handshake.py
+        run: |
+          find backend scripts scanner manager tests -name '*.py' -print0 | xargs -0 python -m py_compile
+      - name: Shell syntax check
+        run: |
+          bash -n certs/*.sh scripts/run_full_experiment.sh
+          sh -n gateway/entrypoint.sh
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Render configuration
+        run: python scripts/render_gateway_config.py --config config/services.json --output /tmp/nginx.conf --check

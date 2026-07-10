@@ -3,6 +3,7 @@ set -eu
 
 mkdir -p /tmp/pq-gateway /var/log/nginx /var/cache/nginx/client_temp
 
+: "${SERVICES_CONFIG:=/etc/pq-gateway/config/services.json}"
 : "${GATEWAY_LISTEN_PORT:=8443}"
 : "${GATEWAY_SERVER_NAME:=bank-gateway.local}"
 : "${GATEWAY_CERT:=/etc/pq-gateway/certs/server.crt}"
@@ -14,69 +15,62 @@ mkdir -p /tmp/pq-gateway /var/log/nginx /var/cache/nginx/client_temp
 : "${CLIENT_AUTH:=off}"
 : "${CLIENT_CA:=/etc/pq-gateway/certs/ca.crt}"
 : "${DNS_RESOLVER:=127.0.0.11}"
-: "${UPSTREAM_CONNECT_TIMEOUT:=3s}"
-: "${UPSTREAM_SEND_TIMEOUT:=30s}"
-: "${UPSTREAM_READ_TIMEOUT:=30s}"
+: "${UPSTREAM_CONNECT_TIMEOUT:=5s}"
+: "${UPSTREAM_SEND_TIMEOUT:=60s}"
+: "${UPSTREAM_READ_TIMEOUT:=60s}"
 
-case "$CLIENT_AUTH" in
-  off)
-    cat > /tmp/pq-gateway/client-auth.conf <<EOF
-# mTLS disabled.
-EOF
-    ;;
-  optional)
-    cat > /tmp/pq-gateway/client-auth.conf <<EOF
+if [ -f "$SERVICES_CONFIG" ]; then
+  echo "pq-gateway v2: rendering multi-service configuration from $SERVICES_CONFIG" >&2
+  python3 /opt/pq-gateway/bin/render_gateway_config.py \
+    --config "$SERVICES_CONFIG" \
+    --output /tmp/pq-gateway/nginx.conf \
+    --check
+else
+  echo "pq-gateway: services config not found; using legacy single-service environment mode" >&2
+
+  case "$CLIENT_AUTH" in
+    off) printf '%s\n' '# mTLS disabled.' > /tmp/pq-gateway/client-auth.conf ;;
+    optional)
+      cat > /tmp/pq-gateway/client-auth.conf <<EOF
 ssl_client_certificate ${CLIENT_CA};
 ssl_verify_client optional;
 ssl_verify_depth 3;
 EOF
-    ;;
-  required|on)
-    cat > /tmp/pq-gateway/client-auth.conf <<EOF
+      ;;
+    required|on)
+      cat > /tmp/pq-gateway/client-auth.conf <<EOF
 ssl_client_certificate ${CLIENT_CA};
 ssl_verify_client on;
 ssl_verify_depth 3;
 EOF
-    ;;
-  *)
-    echo "Unsupported CLIENT_AUTH=$CLIENT_AUTH. Use off, optional, or required." >&2
-    exit 2
-    ;;
-esac
+      ;;
+    *) echo "Unsupported CLIENT_AUTH=$CLIENT_AUTH" >&2; exit 2 ;;
+  esac
 
-case "$UPSTREAM_TLS_VERIFY" in
-  off)
-    cat > /tmp/pq-gateway/upstream-tls.conf <<EOF
+  case "$UPSTREAM_TLS_VERIFY" in
+    off)
+      cat > /tmp/pq-gateway/upstream-tls.conf <<EOF
 proxy_ssl_server_name on;
 proxy_ssl_verify off;
 proxy_ssl_protocols TLSv1.2 TLSv1.3;
 EOF
-    ;;
-  on|required)
-    cat > /tmp/pq-gateway/upstream-tls.conf <<EOF
+      ;;
+    on|required)
+      cat > /tmp/pq-gateway/upstream-tls.conf <<EOF
 proxy_ssl_server_name on;
 proxy_ssl_verify on;
 proxy_ssl_trusted_certificate ${UPSTREAM_CA};
 proxy_ssl_verify_depth 3;
 proxy_ssl_protocols TLSv1.2 TLSv1.3;
 EOF
-    ;;
-  *)
-    echo "Unsupported UPSTREAM_TLS_VERIFY=$UPSTREAM_TLS_VERIFY. Use off or on." >&2
-    exit 2
-    ;;
-esac
+      ;;
+    *) echo "Unsupported UPSTREAM_TLS_VERIFY=$UPSTREAM_TLS_VERIFY" >&2; exit 2 ;;
+  esac
 
-envsubst '${GATEWAY_LISTEN_PORT} ${GATEWAY_SERVER_NAME} ${GATEWAY_CERT} ${GATEWAY_KEY} ${TLS_GROUPS} ${UPSTREAM_URL} ${DNS_RESOLVER} ${UPSTREAM_CONNECT_TIMEOUT} ${UPSTREAM_SEND_TIMEOUT} ${UPSTREAM_READ_TIMEOUT}' \
-  < /etc/pq-gateway/templates/nginx.conf.template \
-  > /tmp/pq-gateway/nginx.conf
+  envsubst '${GATEWAY_LISTEN_PORT} ${GATEWAY_SERVER_NAME} ${GATEWAY_CERT} ${GATEWAY_KEY} ${TLS_GROUPS} ${UPSTREAM_URL} ${DNS_RESOLVER} ${UPSTREAM_CONNECT_TIMEOUT} ${UPSTREAM_SEND_TIMEOUT} ${UPSTREAM_READ_TIMEOUT}' \
+    < /etc/pq-gateway/templates/nginx.conf.template \
+    > /tmp/pq-gateway/nginx.conf
+fi
 
-echo "pq-gateway effective settings:" >&2
-echo "  listen=${GATEWAY_LISTEN_PORT}" >&2
-echo "  server_name=${GATEWAY_SERVER_NAME}" >&2
-echo "  tls_groups=${TLS_GROUPS}" >&2
-echo "  upstream=${UPSTREAM_URL}" >&2
-echo "  client_auth=${CLIENT_AUTH}" >&2
-echo "  upstream_tls_verify=${UPSTREAM_TLS_VERIFY}" >&2
-
+/opt/nginx/sbin/nginx -t -c /tmp/pq-gateway/nginx.conf
 exec /opt/nginx/sbin/nginx -g 'daemon off;' -c /tmp/pq-gateway/nginx.conf
