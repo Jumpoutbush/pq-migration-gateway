@@ -28,7 +28,7 @@ RUN wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
     && make -j"${MAKE_JOBS}" \
     && make install_sw
 
-RUN wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+    RUN wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
     && tar xzf "nginx-${NGINX_VERSION}.tar.gz" \
     && cd "nginx-${NGINX_VERSION}" \
     && ./configure \
@@ -46,9 +46,8 @@ RUN wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
        --with-stream \
        --with-stream_ssl_module \
        --with-threads \
-       --with-openssl="/build/openssl-${OPENSSL_VERSION}" \
-       --with-openssl-opt="--prefix=/opt/openssl --openssldir=/opt/openssl/ssl --libdir=lib no-tests" \
-       --with-ld-opt="-Wl,-rpath,/opt/openssl/lib" \
+       --with-cc-opt="-I/opt/openssl/include" \
+       --with-ld-opt="-L/opt/openssl/lib -Wl,-rpath,/opt/openssl/lib" \
     && make -j"${MAKE_JOBS}" \
     && make install
 

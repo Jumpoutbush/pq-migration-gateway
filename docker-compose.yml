@@ -35,12 +35,16 @@ services:
       GATEWAY_KEY: "/etc/pq-gateway/certs/server.key"
       # Migration default: hybrid PQ first, classical fallback for legacy clients.
       # Strict PQC/hybrid-only test: set this to X25519MLKEM768.
-      TLS_GROUPS: "X25519MLKEM768:X25519"
+      TLS_GROUPS: "X25519MLKEM768:X25519" #:X25519
       UPSTREAM_URL: "http://bank-backend:8080"
       UPSTREAM_TLS_VERIFY: "off"
       # off | optional | required
       CLIENT_AUTH: "off"
       CLIENT_CA: "/etc/pq-gateway/certs/ca.crt"
+      DNS_RESOLVER: "127.0.0.11"
+      UPSTREAM_CONNECT_TIMEOUT: "5s"
+      UPSTREAM_SEND_TIMEOUT: "60s"
+      UPSTREAM_READ_TIMEOUT: "60s"
     volumes:
       - ./certs:/etc/pq-gateway/certs:ro
       - ./scripts:/workspace/scripts:ro
