@@ -20,3 +20,37 @@ experiment-results/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Runtime logs
+/runtime-data/logs/*
+!/runtime-data/logs/.gitkeep
+
+# Prometheus and historical metrics
+/runtime-data/metrics/*
+!/runtime-data/metrics/.gitkeep
+
+# Scanner snapshots and discovered assets
+/runtime-data/scans/*
+!/runtime-data/scans/.gitkeep
+
+# Control-plane database, releases and agent state
+/runtime-data/control/*
+!/runtime-data/control/.gitkeep
+
+# Future runtime directories
+/runtime-data/audit/*
+!/runtime-data/audit/.gitkeep
+
+/runtime-data/certificates/*
+!/runtime-data/certificates/.gitkeep
+
+/runtime-data/alerts/*
+!/runtime-data/alerts/.gitkeep
+
+# SQLite side files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
