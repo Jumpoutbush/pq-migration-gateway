@@ -1,0 +1,4 @@
+asset_id,name,host,port,sni,protocol,owner,environment,criticality
+gw-compat,Compatibility Gateway,pq-gateway,8443,bank-gateway.local,https,platform-team,test,high
+gw-mqtt,MQTT TLS Gateway,pq-gateway,8883,mqtt-gateway.local,mqtts,integration-team,test,medium
+gw-legacy,Legacy TLS Gateway,pq-gateway,16443,legacy-gateway.local,legacy-tls,legacy-team,test,high

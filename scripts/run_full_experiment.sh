@@ -1,267 +1,233 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# PQC Migration Gateway v2 end-to-end experiment.
+# PQC Migration Gateway v3.2 complete experiment.
+# Default build path uses the WSL proxy at 127.0.0.1:7897.
 # Usage:
 #   ./scripts/run_full_experiment.sh
-#   COUNT=100 BUILD=1 ./scripts/run_full_experiment.sh
+#   BUILD=1 PERF_PROFILE=standard ./scripts/run_full_experiment.sh
 
-BENCH_COUNT="${COUNT:-50}"
 BUILD="${BUILD:-0}"
+PERF_PROFILE="${PERF_PROFILE:-standard}"
 RESULT_ROOT="${RESULT_ROOT:-experiment-results}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="${RESULT_ROOT}/${TIMESTAMP}"
-GATEWAY_SERVICE="pq-gateway"
-GATEWAY_CONTAINER="pq-gateway"
-BACKEND_CONTAINER="bank-backend"
+IMAGE="pq-migration-gateway-pq-gateway:3.2"
+PROXY_URL="${WSL_PROXY:-http://127.0.0.1:7897}"
 OPENSSL_BIN="/opt/openssl/bin/openssl"
 CA_CONTAINER="/etc/pq-gateway/certs/ca.crt"
 CA_HOST="certs/ca.crt"
-
 mkdir -p "$RESULT_DIR"
 
-log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-require() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
-
-on_error() {
-  local code=$?
-  printf '\nExperiment failed with exit code %s.\n' "$code" >&2
-  docker compose ps -a >&2 || true
-  docker compose logs --no-color --tail=120 "$GATEWAY_SERVICE" >&2 || true
+log(){ printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+die(){ printf 'ERROR: %s\n' "$*" >&2;exit 1; }
+require(){ command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+write_status(){
+  local status="$1" message="$2" code="$3"
+  python3 - "$RESULT_DIR/experiment-status.json" "$status" "$message" "$code" <<'PY'
+import json,sys,time
+open(sys.argv[1],'w').write(json.dumps({'generated_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'status':sys.argv[2],'message':sys.argv[3],'exit_code':int(sys.argv[4])},indent=2)+'\n')
+PY
+}
+on_error(){
+  local code=$? line=${BASH_LINENO[0]:-unknown}
+  trap - ERR
+  write_status FAIL "Experiment stopped near line ${line}" "$code" || true
+  docker compose ps -a >"$RESULT_DIR/docker-compose-ps-failure.txt" 2>&1 || true
+  docker compose logs --no-color --tail=160 pq-gateway >"$RESULT_DIR/gateway-failure.log" 2>&1 || true
+  printf '\nExperiment failed with exit code %s near line %s.\n' "$code" "$line" >&2
   exit "$code"
 }
 trap on_error ERR
 
-wait_container() {
-  local container="$1" expected="$2" retries=60 status=""
-  for ((i=1; i<=retries; i++)); do
+build_gateway(){
+  log "Building $IMAGE through WSL proxy $PROXY_URL"
+  docker build \
+    --network=host \
+    --build-arg OPENSSL_VERSION=3.5.0 \
+    --build-arg NGINX_VERSION=1.28.0 \
+    --build-arg MAKE_JOBS=4 \
+    --build-arg HTTP_PROXY="$PROXY_URL" \
+    --build-arg HTTPS_PROXY="$PROXY_URL" \
+    --build-arg http_proxy="$PROXY_URL" \
+    --build-arg https_proxy="$PROXY_URL" \
+    --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
+    --build-arg no_proxy=localhost,127.0.0.1,::1 \
+    -f docker/Dockerfile.gateway \
+    -t "$IMAGE" .
+}
+wait_state(){
+  local container="$1" expected="$2" retries="${3:-90}" status=''
+  for ((i=1;i<=retries;i++));do
     status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)"
     [[ "$status" == "$expected" ]] && return 0
     sleep 1
   done
-  die "$container did not reach state $expected (last state: ${status:-missing})"
+  die "$container did not reach $expected; last=${status:-missing}"
 }
-
-handshake_success() {
+handshake_success(){
   local port="$1" sni="$2" group="$3" output="$4"
-  log "TLS success test: ${sni}:${port} group=${group}"
-  docker compose exec -T "$GATEWAY_SERVICE" \
-    "$OPENSSL_BIN" s_client -connect "localhost:${port}" -servername "$sni" \
-    -tls1_3 -groups "$group" -CAfile "$CA_CONTAINER" -verify_return_error -brief \
-    </dev/null >"$output" 2>&1
-  cat "$output"
+  docker compose exec -T pq-gateway "$OPENSSL_BIN" s_client \
+    -connect "localhost:${port}" -servername "$sni" -tls1_3 -groups "$group" \
+    -CAfile "$CA_CONTAINER" -verify_return_error -brief </dev/null >"$output" 2>&1
   grep -q 'Verification: OK' "$output"
-  grep -Eq "Negotiated TLS1\\.3 group: ${group}|Server Temp Key: ${group}|Peer Temp Key: ${group}" "$output"
+  grep -q "$group" "$output"
 }
-
-handshake_expected_failure() {
-  local port="$1" sni="$2" group="$3" output="$4"
-  local rc
-
-  log "TLS rejection test: ${sni}:${port} group=${group}"
-
-  if docker compose exec -T "$GATEWAY_SERVICE" \
-    "$OPENSSL_BIN" s_client \
-      -connect "localhost:${port}" \
-      -servername "$sni" \
-      -tls1_3 \
-      -groups "$group" \
-      -CAfile "$CA_CONTAINER" \
-      -brief \
-      </dev/null >"$output" 2>&1
-  then
-    rc=0
-  else
-    rc=$?
+handshake_expected_failure(){
+  local port="$1" sni="$2" group="$3" output="$4" rc
+  if docker compose exec -T pq-gateway "$OPENSSL_BIN" s_client \
+      -connect "localhost:${port}" -servername "$sni" -tls1_3 -groups "$group" \
+      -CAfile "$CA_CONTAINER" -brief </dev/null >"$output" 2>&1; then rc=0;else rc=$?;fi
+  if grep -q 'Verification: OK' "$output" && grep -q 'TLSv1.3' "$output";then
+    die "Expected ${sni}:${port} to reject $group"
   fi
-
-  cat "$output"
-
-  if grep -q 'Verification: OK' "$output" &&
-     grep -Eq 'Negotiated TLS1\.3 group:|Server Temp Key:|Peer Temp Key:' "$output"
-  then
-    die "Expected ${sni}:${port} to reject group ${group}, but TLS succeeded"
-  fi
-
-  if [[ $rc -eq 0 ]]; then
-    die "Expected TLS rejection, but openssl returned success"
-  fi
-
-  if grep -Eqi \
-    'alert handshake failure|alert number 40|no suitable key share|handshake failure' \
-    "$output"
-  then
-    log "Expected TLS rejection confirmed"
-  else
-    log "TLS connection was rejected with exit code ${rc}"
-  fi
+  [[ $rc -ne 0 ]]
+  grep -Eqi 'alert handshake failure|alert number 40|no suitable key share|handshake failure' "$output"
+}
+http_get(){
+  local port="$1" host="$2" path="$3" output="$4"
+  curl --noproxy '*' --fail-with-body --silent --show-error --connect-timeout 5 --max-time 20 \
+    --resolve "${host}:${port}:127.0.0.1" --cacert "$CA_HOST" \
+    "https://${host}:${port}${path}" >"$output"
+}
+extract_log_delta(){
+  local file="$1" start="$2" output="$3"
+  if [[ -f "$file" ]];then tail -n "+$((start+1))" "$file" >"$output";else : >"$output";fi
 }
 
-http_get_host() {
-  local port="$1" sni="$2" path="$3" output="$4"
-  curl --noproxy '*' --fail-with-body --silent --show-error \
-    --connect-timeout 10 --max-time 30 \
-    --resolve "${sni}:${port}:127.0.0.1" --cacert "$CA_HOST" \
-    "https://${sni}:${port}${path}" | tee "$output"
-  printf '\n'
-}
-
-http_with_openssl() {
-  local port="$1" sni="$2" group="$3" path="$4" output="$5"
-  set +e
-  printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$sni" | \
-    timeout 20s docker compose exec -T "$GATEWAY_SERVICE" \
-      "$OPENSSL_BIN" s_client -quiet -connect "localhost:${port}" -servername "$sni" \
-      -tls1_3 -groups "$group" -CAfile "$CA_CONTAINER" -verify_return_error \
-      >"$output" 2>&1
-  set -e
-  grep -q '200 OK' "$output" || { cat "$output"; die "HTTP request failed for ${sni}:${port} group=${group}"; }
-}
-
-benchmark() {
-  local port="$1" sni="$2" group="$3" container_out="$4" host_out="$5"
-  log "Benchmark: ${sni}:${port} group=${group} count=${BENCH_COUNT}"
-  docker compose exec -T "$GATEWAY_SERVICE" \
-    python3 /workspace/scripts/bench_handshake.py \
-      --host localhost --port "$port" --sni "$sni" --groups "$group" \
-      --openssl "$OPENSSL_BIN" --cafile "$CA_CONTAINER" --count "$BENCH_COUNT" \
-      --out "$container_out"
-  docker cp "${GATEWAY_CONTAINER}:${container_out}" "$host_out"
-}
-
-write_summary() {
-  python3 - "$RESULT_DIR" "$BENCH_COUNT" <<'PY'
-import json, sys
+write_summary(){
+  python3 - "$RESULT_DIR" "$PERF_PROFILE" <<'PY'
+import json,sys
 from pathlib import Path
-root=Path(sys.argv[1]); count=sys.argv[2]
-def load(name):
-    p=root/name
-    return json.loads(p.read_text()) if p.exists() else {}
-static=load('crypto-inventory.json').get('summary', {})
-tls=load('tls-inventory.json').get('summary', {})
-risk=load('risk-report.json').get('summary', {})
-verify=load('migration-verification.json').get('summary', {})
-fallback=load('fallback-report.json').get('summary', {})
-db=load('inventory-db-summary.json')
-text=f'''# PQC Migration Gateway v2 Experiment Summary
+r=Path(sys.argv[1]);profile=sys.argv[2]
+def load(path,default=None):
+    p=r/path
+    if not p.exists():return default or {}
+    return json.loads(p.read_text())
+static=load('crypto-inventory.json').get('summary',{});tls=load('tls-inventory.json').get('summary',{});risk=load('risk-report.json').get('summary',{});verify=load('migration-verification.json').get('summary',{});db=load('inventory-db-summary.json');mtls=load('mtls/mtls-matrix.json').get('summary',{});up=load('upstream/upstream-tls-matrix.json').get('summary',{});stream=load('stream/stream-protocol-matrix.json').get('summary',{});runtime=load('runtime-fallback-report.json').get('summary',{});experiment=load('experiment-fallback-report.json').get('summary',{});perf=load('performance/performance-report.json').get('summary',{});disc=load('network-discovery.json').get('summary',{});cmdb=load('cmdb-targets.json').get('summary',{})
+text=f'''# PQC Migration Gateway v3.2 Experiment Summary
 
-## Result
+## Overall result
 
-- Multi-service configuration: validated
-- Compatibility endpoint: Hybrid/PQC and X25519 both accepted
+- HTTP/HTTPS and Stream configuration: validated
+- Compatibility endpoint: Hybrid/PQC and X25519 accepted
 - Strict endpoint: Hybrid/PQC accepted and X25519 rejected
-- Transparent reverse proxy: validated with protocol-neutral service endpoints
-- Static cryptographic inventory: completed
-- Online TLS inventory: completed
-- Risk assessment and SQLite import: completed
-- Migration policy verification: {verify.get("passed", 0)}/{verify.get("services", 0)} passed
-- Handshake benchmark repetitions per group: {count}
+- mTLS matrix: {mtls.get('passed',0)}/{mtls.get('tests',0)} passed
+- Upstream HTTPS/SNI/mTLS/negative CA/rotation matrix: {up.get('passed',0)}/{up.get('tests',0)} passed
+- MQTT TLS, generic TCP TLS and legacy protocol TLS: {stream.get('passed',0)}/{stream.get('tests',0)} passed
+- Migration policy verification: {verify.get('passed',0)}/{verify.get('services',0)} passed
+- Performance profile: {profile}; failed benchmark cases: {perf.get('failed_tests',0)}
 
-## Inventory
+## Enterprise discovery and inventory
 
-- Concrete assets: {static.get("concrete_assets", 0)}
-- Source/configuration evidence: {static.get("source_evidence", 0)}
-- Online endpoints: {tls.get("endpoints", 0)}
-- PQC-capable endpoints: {tls.get("pqc_supported", 0)}
-- Risk findings: {risk.get("total", 0)}
-- SQLite assets/endpoints: {db.get("assets", 0)}/{db.get("endpoints", 0)}
+- Concrete cryptographic assets: {static.get('concrete_assets',0)}
+- Source/configuration evidence: {static.get('source_evidence',0)}
+- Normalized CMDB targets: {cmdb.get('targets',0)}
+- CIDR candidates/open endpoints: {disc.get('candidates',0)}/{disc.get('open',0)}
+- TLS endpoints scanned: {tls.get('endpoints',0)}
+- PQC-capable endpoints: {tls.get('pqc_supported',0)}
+- Risk findings: {risk.get('total',0)}
+- SQLite assets/endpoints/CMDB assets: {db.get('assets',0)}/{db.get('endpoints',0)}/{db.get('cmdb_assets',0)}
 
-## Runtime migration metrics
+## Persistent runtime migration metrics
 
-- Recorded requests: {fallback.get("connections", 0)}
-- Hybrid/PQC requests: {fallback.get("hybrid_pqc", 0)}
-- Classical fallback requests: {fallback.get("classical_fallback", 0)}
-- Hybrid adoption rate: {fallback.get("hybrid_adoption_rate")}
+- All recorded connections: {runtime.get('connections',0)}
+- Hybrid/PQC: {runtime.get('hybrid_pqc',0)}
+- Classical fallback: {runtime.get('classical_fallback',0)}
+- Hybrid adoption rate: {runtime.get('hybrid_adoption_rate')}
 
-## Files
+The persistent metrics include traffic accumulated in `runtime-data/logs`, not only this experiment. This experiment alone recorded {experiment.get('connections',0)} connections.
 
-- `crypto-inventory.json` / `.csv`
-- `tls-inventory.json` / `.csv`
-- `risk-report.json`
-- `inventory.db`
+## Important outputs
+
+- `experiment-status.json`
+- `mtls/mtls-matrix.json`
+- `upstream/upstream-tls-matrix.json`
+- `stream/stream-protocol-matrix.json`
+- `crypto-inventory.json` and `tls-inventory.json`
+- `network-discovery.json` and `cmdb-targets.json`
+- `continuous-scan-latest.json` and `continuous-scan-diff.json`
+- `risk-report.json` and `inventory.db`
 - `migration-verification.json`
-- `fallback-report.json`
-- `handshake-hybrid.json`
-- `handshake-x25519.json`
-- `gateway-access.log`
-- TLS transcript files
+- `runtime-fallback-report.json` and `experiment-fallback-report.json`
+- `performance/performance-report.json`, `.csv`, and `PERFORMANCE.md`
 '''
-(root/'SUMMARY.md').write_text(text)
+(r/'SUMMARY.md').write_text(text)
 PY
 }
 
-main() {
-  require docker
-  require curl
-  require python3
-  require timeout
-  [[ -f config/services.json ]] || die 'config/services.json not found'
-
-  log 'Validating multi-service configuration'
+main(){
+  require docker;require curl;require python3;require timeout
+  [[ -f config/services.json ]]
+  log 'Validating v3 HTTP and Stream gateway configuration'
   python3 scripts/render_gateway_config.py --config config/services.json --output "$RESULT_DIR/rendered-nginx.conf" --check
+  log 'Generating gateway, client and upstream demo PKI'
+  ./certs/gen-classic-demo-certs.sh ./certs >"$RESULT_DIR/certificate-generation.txt"
 
-  log 'Generating fresh demo certificates with all configured DNS names'
-  ./certs/gen-classic-demo-certs.sh ./certs
+  if [[ "$BUILD" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1;then build_gateway;else log "Using existing $IMAGE; set BUILD=1 to rebuild";fi
+  mkdir -p runtime-data/logs runtime-data/metrics runtime-data/scans
+  HTTP_START=0
+  STREAM_START=0
+  [[ -f runtime-data/logs/access.log ]] && HTTP_START=$(wc -l < runtime-data/logs/access.log)
+  [[ -f runtime-data/logs/stream-access.log ]] && STREAM_START=$(wc -l < runtime-data/logs/stream-access.log)
 
-  if [[ "$BUILD" == "1" ]] || [[ -z "$(docker compose images -q "$GATEWAY_SERVICE" 2>/dev/null)" ]]; then
-    log 'Building gateway image'
-    docker compose build "$GATEWAY_SERVICE"
-  else
-    log 'Using existing gateway image; set BUILD=1 to rebuild'
-  fi
-
-  docker compose up -d --force-recreate
-  wait_container "$BACKEND_CONTAINER" healthy
-  wait_container "$GATEWAY_CONTAINER" healthy
+  docker compose up -d --no-build --force-recreate
+  wait_state bank-backend healthy;wait_state secure-backend healthy;wait_state tcp-backend healthy;wait_state legacy-backend healthy;wait_state mqtt-broker healthy;wait_state pq-gateway healthy
   docker compose ps | tee "$RESULT_DIR/docker-compose-ps.txt"
+  docker compose exec -T pq-gateway "$OPENSSL_BIN" version -a >"$RESULT_DIR/openssl-version.txt" 2>&1
+  docker compose exec -T pq-gateway /opt/nginx/sbin/nginx -V >"$RESULT_DIR/nginx-build.txt" 2>&1
 
-  docker compose exec -T "$GATEWAY_SERVICE" "$OPENSSL_BIN" version -a >"$RESULT_DIR/openssl-version.txt" 2>&1
-  docker compose exec -T "$GATEWAY_SERVICE" /opt/nginx/sbin/nginx -V >"$RESULT_DIR/nginx-build.txt" 2>&1
-  docker compose exec -T "$GATEWAY_SERVICE" sh -c ': > /var/log/nginx/access.log'
-
+  log 'Testing compatibility and strict TLS policies'
   handshake_success 8443 bank-gateway.local X25519MLKEM768 "$RESULT_DIR/tls-compat-hybrid.txt"
   handshake_success 8443 bank-gateway.local X25519 "$RESULT_DIR/tls-compat-x25519.txt"
   handshake_success 9443 strict-gateway.local X25519MLKEM768 "$RESULT_DIR/tls-strict-hybrid.txt"
   handshake_expected_failure 9443 strict-gateway.local X25519 "$RESULT_DIR/tls-strict-x25519-rejected.txt"
+  http_get 8443 bank-gateway.local /service-info "$RESULT_DIR/service-info.json"
 
-  log 'Testing transparent HTTP reverse proxy without host proxy variables'
-  http_get_host 8443 bank-gateway.local /service-info "$RESULT_DIR/service-info-compat.json"
-  http_with_openssl 8443 bank-gateway.local X25519MLKEM768 /service-info "$RESULT_DIR/http-hybrid.txt"
-  http_with_openssl 8443 bank-gateway.local X25519 /service-info "$RESULT_DIR/http-x25519.txt"
-  http_with_openssl 9443 strict-gateway.local X25519MLKEM768 /service-info "$RESULT_DIR/http-strict-hybrid.txt"
+  log 'Running complete client mTLS matrix'
+  ./scripts/test_mtls_matrix.sh "$RESULT_DIR/mtls"
+  log 'Running upstream HTTPS, SNI, gateway mTLS, negative CA and certificate rotation matrix'
+  ./scripts/test_upstream_tls.sh "$RESULT_DIR/upstream"
+  log 'Running MQTT TLS, generic TCP TLS and legacy protocol tests'
+  ./scripts/test_stream_protocols.sh "$RESULT_DIR/stream"
 
-  log 'Running static cryptographic inventory v2'
-  python3 scripts/crypto_inventory.py \
-    --root ./certs --root ./gateway --root ./config --root ./docker-compose.yml \
-    --root ./scripts --root ./scanner --root ./manager \
-    --out-json "$RESULT_DIR/crypto-inventory.json" \
-    --out-csv "$RESULT_DIR/crypto-inventory.csv"
+  log 'Running static cryptographic inventory'
+  python3 scripts/crypto_inventory.py --root ./certs --root ./gateway --root ./backend --root ./config --root ./docker-compose.yml --root ./scripts --root ./scanner --root ./manager --out-json "$RESULT_DIR/crypto-inventory.json" --out-csv "$RESULT_DIR/crypto-inventory.csv"
+  log 'Importing sample CMDB assets into normalized targets'
+  PYTHONPATH=scanner python3 scanner/cmdb_import.py --input config/cmdb/sample-assets.csv --out-json "$RESULT_DIR/cmdb-targets.json" --out-csv "$RESULT_DIR/cmdb-targets.csv"
+  log 'Running explicit CIDR discovery against locally exposed test ports'
+  PYTHONPATH=scanner python3 scanner/network_discovery.py --cidr 127.0.0.1/32 --ports 8443,9443,10443,11443,12443,13443,14443,8883,15443,16443 --max-hosts 16 --workers 20 --timeout 2 --out-json "$RESULT_DIR/network-discovery.json" --out-csv "$RESULT_DIR/network-discovery.csv"
 
-  log 'Running online TLS inventory with OpenSSL 3.5 inside the gateway container'
-  docker compose exec -T "$GATEWAY_SERVICE" \
-    python3 /workspace/scanner/tls_scanner.py \
-      --endpoint 'localhost:8443,bank-gateway.local' \
-      --endpoint 'localhost:9443,strict-gateway.local' \
-      --groups X25519MLKEM768:X25519 \
-      --openssl "$OPENSSL_BIN" --cafile "$CA_CONTAINER" \
-      --out-json /tmp/tls-inventory.json --out-csv /tmp/tls-inventory.csv
-  docker cp "$GATEWAY_CONTAINER:/tmp/tls-inventory.json" "$RESULT_DIR/tls-inventory.json"
-  docker cp "$GATEWAY_CONTAINER:/tmp/tls-inventory.csv" "$RESULT_DIR/tls-inventory.csv"
+  log 'Running batch online TLS inventory through OpenSSL 3.5'
+  docker compose exec -T pq-gateway python3 /workspace/scanner/tls_scanner.py --targets-file /etc/pq-gateway/config/scan-targets.json --groups X25519MLKEM768:X25519 --openssl "$OPENSSL_BIN" --cafile "$CA_CONTAINER" --workers 10 --allow-unreachable --out-json /tmp/tls-inventory.json --out-csv /tmp/tls-inventory.csv
+  docker cp pq-gateway:/tmp/tls-inventory.json "$RESULT_DIR/tls-inventory.json";docker cp pq-gateway:/tmp/tls-inventory.csv "$RESULT_DIR/tls-inventory.csv"
+
+  log 'Running one scheduled continuous-scan iteration and change detection'
+  docker compose exec -T pq-gateway python3 /workspace/scanner/continuous_scan.py --config /etc/pq-gateway/config/continuous-scan.json --once >"$RESULT_DIR/continuous-scan-run.txt"
+  cp runtime-data/scans/latest.json "$RESULT_DIR/continuous-scan-latest.json"
+  latest_scan_dir=$(find runtime-data/scans -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+  [[ -n "$latest_scan_dir" ]] && cp "$latest_scan_dir/diff.json" "$RESULT_DIR/continuous-scan-diff.json"
 
   python3 manager/risk_engine.py --static "$RESULT_DIR/crypto-inventory.json" --tls "$RESULT_DIR/tls-inventory.json" --out "$RESULT_DIR/risk-report.json"
-  python3 manager/inventory_db.py --db "$RESULT_DIR/inventory.db" --static "$RESULT_DIR/crypto-inventory.json" --tls "$RESULT_DIR/tls-inventory.json" --risk "$RESULT_DIR/risk-report.json" --summary-json "$RESULT_DIR/inventory-db-summary.json"
+  python3 manager/inventory_db.py --db "$RESULT_DIR/inventory.db" --static "$RESULT_DIR/crypto-inventory.json" --tls "$RESULT_DIR/tls-inventory.json" --risk "$RESULT_DIR/risk-report.json" --cmdb "$RESULT_DIR/cmdb-targets.json" --summary-json "$RESULT_DIR/inventory-db-summary.json"
   python3 manager/verify_migration.py --services config/services.json --tls "$RESULT_DIR/tls-inventory.json" --out "$RESULT_DIR/migration-verification.json"
 
-  docker compose exec -T "$GATEWAY_SERVICE" sh -c 'cat /var/log/nginx/access.log' > "$RESULT_DIR/gateway-access.log"
-  python3 manager/fallback_report.py --log "$RESULT_DIR/gateway-access.log" --out "$RESULT_DIR/fallback-report.json"
-
-  benchmark 8443 bank-gateway.local X25519MLKEM768 /tmp/handshake-hybrid.json "$RESULT_DIR/handshake-hybrid.json"
-  benchmark 8443 bank-gateway.local X25519 /tmp/handshake-x25519.json "$RESULT_DIR/handshake-x25519.json"
-
-  docker compose logs --no-color --tail=300 "$GATEWAY_SERVICE" > "$RESULT_DIR/gateway-container.log"
+  extract_log_delta runtime-data/logs/access.log "$HTTP_START" "$RESULT_DIR/experiment-http-access.log"
+  extract_log_delta runtime-data/logs/stream-access.log "$STREAM_START" "$RESULT_DIR/experiment-stream-access.log"
+  python3 manager/fallback_report.py --log "$RESULT_DIR/experiment-http-access.log" --log "$RESULT_DIR/experiment-stream-access.log" --out "$RESULT_DIR/experiment-fallback-report.json"
+  python3 manager/fallback_report.py --log runtime-data/logs/access.log --log runtime-data/logs/stream-access.log --out "$RESULT_DIR/runtime-fallback-report.json"
+  python3 manager/runtime_metrics.py \
+  --log runtime-data/logs/access.log \
+  --log runtime-data/logs/stream-access.log \
+  --error-log runtime-data/logs/error.log \
+  --out "$RESULT_DIR/runtime-metrics-current.json" \
+  --prometheus "$RESULT_DIR/pqc_gateway.prom" \
+  --once
+  
+  log "Running complete performance suite profile=$PERF_PROFILE"
+  PERF_PROFILE="$PERF_PROFILE" ./scripts/run_performance_suite.sh "$RESULT_DIR/performance"
   write_summary
-  log "All v2 experiments completed: $RESULT_DIR"
+  write_status PASS 'All v3.2 experiments completed successfully' 0
+  log "All v3.2 experiments completed: $RESULT_DIR"
 }
-
 main "$@"

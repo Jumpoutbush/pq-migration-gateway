@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "interval_seconds": 300,
+  "retention": 48,
+  "targets_files": ["/etc/pq-gateway/config/scan-targets.json"],
+  "cmdb_files": ["/etc/pq-gateway/config/cmdb/sample-assets.csv"],
+  "cidrs": [],
+  "ports": [443, 8443, 8883, 9443, 10443, 12443, 15443, 16443],
+  "max_hosts": 4096,
+  "workers": 64,
+  "timeout": 2.0,
+  "groups": "X25519MLKEM768:X25519",
+  "openssl": "/opt/openssl/bin/openssl",
+  "cafile": "/etc/pq-gateway/certs/ca.crt",
+  "output_dir": "/var/lib/pq-scanner"
+}

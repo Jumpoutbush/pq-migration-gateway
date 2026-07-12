@@ -9,7 +9,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from gateway.model import compatibility_view
 
 def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -32,7 +35,7 @@ class RendererTests(unittest.TestCase):
     def test_renderer_rejects_injection(self):
         renderer = load_module("renderer_bad", ROOT / "scripts" / "render_gateway_config.py")
         config = json.loads((ROOT / "config" / "services.json").read_text())
-        config["services"][0]["server_name"] = "bad; include /tmp/x"
+        config["services"][0]["listen"]["server_name"] = "bad; include /tmp/x"
         with self.assertRaises(renderer.ConfigError):
             renderer.render(config)
 
@@ -55,10 +58,18 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(report["summary"]["classical_fallback"], 1)
 
     def test_migration_verification(self):
+        config = json.loads(
+            (ROOT / "config" / "services.json").read_text()
+        )
+
         tls = {
             "endpoints": [
-                {"sni": "bank-gateway.local", "port": 8443, "supported_groups": ["X25519MLKEM768", "X25519"]},
-                {"sni": "strict-gateway.local", "port": 9443, "supported_groups": ["X25519MLKEM768"]},
+                {
+                    "sni": service["server_name"],
+                    "port": service["listen_port"],
+                    "supported_groups": service["tls_groups"].split(":"),
+                }
+                for service in compatibility_view(config)
             ]
         }
         with tempfile.TemporaryDirectory() as td:

@@ -33,6 +33,8 @@ class DemoBackendHandler(BaseHTTPRequestHandler):
                 "forwarded_protocol": self.headers.get("X-PQ-TLS-Protocol", ""),
                 "forwarded_group": self.headers.get("X-PQ-TLS-Group", ""),
                 "gateway_service": self.headers.get("X-PQ-Service", ""),
+                "client_verify": self.headers.get("X-Forwarded-Client-Verify", ""),
+                "client_dn": self.headers.get("X-Forwarded-Client-DN", ""),
             })
         elif path == "/api/balance":  # backward-compatible test endpoint
             self._send_json(200, {"account": "demo-001", "currency": "CNY", "available": "1000000.00"})

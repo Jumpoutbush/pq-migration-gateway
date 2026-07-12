@@ -1,21 +1,101 @@
 services:
   bank-backend:
-    image: python:3.12-slim
+    image: pq-migration-gateway-pq-gateway:3.2
     container_name: bank-backend
     working_dir: /app
-    command: ["python", "/app/bank_backend.py", "--host", "0.0.0.0", "--port", "8080"]
+    entrypoint: ["python3"]
+    command: ["/app/bank_backend.py", "--host", "0.0.0.0", "--port", "8080"]
     volumes:
       - ./backend:/app:ro
-    expose:
-      - "8080"
+    expose: ["8080"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  secure-backend:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: secure-backend
+    working_dir: /app
+    entrypoint: ["python3"]
+    command:
+      - /app/secure_backend.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8443"
+      - --cert
+      - /certs/upstream/server.crt
+      - --key
+      - /certs/upstream/server.key
+      - --client-ca
+      - /certs/upstream/ca.crt
+      - --require-client-cert
+    volumes:
+      - ./backend:/app:ro
+      - ./certs:/certs:ro
+    expose: ["8443"]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import ssl,urllib.request;
+          c=ssl.create_default_context(cafile='/certs/upstream/ca.crt');
+          c.load_cert_chain('/certs/upstream/client.crt','/certs/upstream/client.key');
+          urllib.request.urlopen('https://localhost:8443/healthz',context=c,timeout=3).read()
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  tcp-backend:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: tcp-backend
+    working_dir: /app
+    entrypoint: ["python3"]
+    command: ["/app/tcp_echo_backend.py", "--host", "0.0.0.0", "--port", "9000"]
+    volumes:
+      - ./backend:/app:ro
+    expose: ["9000"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket;s=socket.create_connection(('127.0.0.1',9000),2);s.sendall(b'x');assert s.recv(16).startswith(b'ECHO');s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  legacy-backend:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: legacy-backend
+    working_dir: /app
+    entrypoint: ["python3"]
+    command: ["/app/legacy_line_backend.py", "--host", "0.0.0.0", "--port", "9100"]
+    volumes:
+      - ./backend:/app:ro
+    expose: ["9100"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket;s=socket.create_connection(('127.0.0.1',9100),2);assert b'READY' in s.recv(128);s.sendall(b'PING\\r\\n');assert b'PONG' in s.recv(128);s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mqtt-broker:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: mqtt-broker
+    entrypoint: ["python3", "/app/mqtt_broker.py"]
+    command: ["--host", "0.0.0.0", "--port", "1883"]
+    volumes:
+      - ./backend:/app:ro
+    expose: ["1883"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket;s=socket.create_connection(('127.0.0.1',1883),2);s.close()"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   pq-gateway:
-    image: pq-migration-gateway-pq-gateway:2.0
+    image: pq-migration-gateway-pq-gateway:3.2
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
@@ -32,21 +112,118 @@ services:
         no_proxy: "${no_proxy:-localhost,127.0.0.1,::1}"
     container_name: pq-gateway
     depends_on:
-      bank-backend:
-        condition: service_healthy
+      bank-backend: {condition: service_healthy}
+      secure-backend: {condition: service_healthy}
+      tcp-backend: {condition: service_healthy}
+      legacy-backend: {condition: service_healthy}
+      mqtt-broker: {condition: service_healthy}
     ports:
       - "8443:8443"
       - "9443:9443"
+      - "10443:10443"
+      - "11443:11443"
+      - "12443:12443"
+      - "13443:13443"
+      - "14443:14443"
+      - "8883:8883"
+      - "15443:15443"
+      - "16443:16443"
     environment:
       SERVICES_CONFIG: "/etc/pq-gateway/config/services.json"
+      PQ_CONTROL_ENABLED: "true"
+      PQ_CONTROL_DIR: "/var/lib/pq-control"
+      PQ_CONTROL_DB: "/var/lib/pq-control/control-plane.db"
+      PQ_AGENT_ID: "pq-gateway-1"
+      PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:-}"
+      PQ_AGENT_HEALTH_COMMAND: "curl --noproxy '*' -fsS --resolve bank-gateway.local:8443:127.0.0.1 --cacert /etc/pq-gateway/certs/ca.crt https://bank-gateway.local:8443/healthz >/dev/null"
     volumes:
       - ./certs:/etc/pq-gateway/certs:ro
       - ./config:/etc/pq-gateway/config:ro
       - ./scripts:/workspace/scripts:ro
       - ./scanner:/workspace/scanner:ro
       - ./manager:/workspace/manager:ro
+      - ./runtime-data/logs:/var/log/nginx
+      - ./runtime-data/scans:/var/lib/pq-scanner
+      - ./runtime-data/control:/var/lib/pq-control
     healthcheck:
       test: ["CMD-SHELL", "curl --noproxy '*' -fsS --resolve bank-gateway.local:8443:127.0.0.1 --cacert /etc/pq-gateway/certs/ca.crt https://bank-gateway.local:8443/healthz >/dev/null"]
       interval: 10s
       timeout: 5s
+      retries: 15
+
+  metrics-agent:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: pq-metrics-agent
+    depends_on:
+      pq-gateway: {condition: service_healthy}
+    working_dir: /workspace
+    entrypoint: ["python3"]
+    command:
+      - /workspace/manager/runtime_metrics.py
+      - --log
+      - /var/log/nginx/access.log
+      - --log
+      - /var/log/nginx/stream-access.log
+      - --error-log
+      - /var/log/nginx/error.log
+      - --out
+      - /var/lib/pq-metrics/current.json
+      - --prometheus
+      - /var/lib/pq-metrics/pqc_gateway.prom
+      - --history
+      - /var/lib/pq-metrics/history.jsonl
+      - --db
+      - /var/lib/pq-control/control-plane.db
+      - --interval
+      - "30"
+    volumes:
+      - ./manager:/workspace/manager:ro
+      - ./runtime-data/logs:/var/log/nginx:ro
+      - ./runtime-data/metrics:/var/lib/pq-metrics
+      - ./runtime-data/control:/var/lib/pq-control
+    restart: unless-stopped
+
+  scanner-scheduler:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: pq-scanner-scheduler
+    profiles: ["continuous-scan"]
+    depends_on:
+      pq-gateway: {condition: service_healthy}
+    entrypoint: ["python3", "/workspace/scanner/continuous_scan.py"]
+    command: ["--config", "/etc/pq-gateway/config/continuous-scan.json"]
+    volumes:
+      - ./config:/etc/pq-gateway/config:ro
+      - ./certs:/etc/pq-gateway/certs:ro
+      - ./scanner:/workspace/scanner:ro
+      - ./runtime-data/scans:/var/lib/pq-scanner
+    restart: unless-stopped
+
+  manager-api:
+    image: pq-migration-gateway-pq-gateway:3.2
+    container_name: pq-manager-api
+    profiles: ["control-plane"]
+    depends_on:
+      pq-gateway: {condition: service_healthy}
+    entrypoint: ["python3", "/opt/pq-gateway/manager/manager_api.py"]
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18080"
+      - --db
+      - /var/lib/pq-control/control-plane.db
+      - --control-dir
+      - /var/lib/pq-control
+    environment:
+      MANAGER_API_TOKEN: "${MANAGER_API_TOKEN:-development-only-change-me}"
+      PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:-}"
+    ports:
+      - "127.0.0.1:18080:18080"
+    volumes:
+      - ./runtime-data/control:/var/lib/pq-control
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
       retries: 10
+    restart: unless-stopped

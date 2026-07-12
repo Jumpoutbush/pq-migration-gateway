@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "targets": [
+    {
+      "asset_id": "gateway-compat",
+      "host": "pq-gateway",
+      "port": 8443,
+      "sni": "bank-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-mqtt",
+      "host": "pq-gateway",
+      "port": 8883,
+      "sni": "mqtt-gateway.local",
+      "protocol": "mqtts",
+      "owner": "integration-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-strict",
+      "host": "pq-gateway",
+      "port": 9443,
+      "sni": "strict-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-mtls",
+      "host": "pq-gateway",
+      "port": 10443,
+      "sni": "mtls-gateway.local",
+      "protocol": "https",
+      "owner": "security-team",
+      "environment": "test",
+      "client_certificate": "/etc/pq-gateway/certs/client.crt",
+      "client_key": "/etc/pq-gateway/certs/client.key"
+    },
+    {
+      "asset_id": "gateway-mtls-optional",
+      "host": "pq-gateway",
+      "port": 11443,
+      "sni": "optional-mtls-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-upstream",
+      "host": "pq-gateway",
+      "port": 12443,
+      "sni": "upstream-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-badca",
+      "host": "pq-gateway",
+      "port": 13443,
+      "sni": "badca-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-upstream-noclient",
+      "host": "pq-gateway",
+      "port": 14443,
+      "sni": "upstream-noclient-gateway.local",
+      "protocol": "https",
+      "owner": "platform-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-tcp",
+      "host": "pq-gateway",
+      "port": 15443,
+      "sni": "tcp-gateway.local",
+      "protocol": "tls-tcp",
+      "owner": "integration-team",
+      "environment": "test"
+    },
+    {
+      "asset_id": "gateway-legacy",
+      "host": "pq-gateway",
+      "port": 16443,
+      "sni": "legacy-gateway.local",
+      "protocol": "legacy-tls",
+      "owner": "legacy-team",
+      "environment": "test"
+    }
+  ]
+}

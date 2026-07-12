@@ -20,7 +20,7 @@ mkdir -p /tmp/pq-gateway /var/log/nginx /var/cache/nginx/client_temp
 : "${UPSTREAM_READ_TIMEOUT:=60s}"
 
 if [ -f "$SERVICES_CONFIG" ]; then
-  echo "pq-gateway v2: rendering multi-service configuration from $SERVICES_CONFIG" >&2
+  echo "pq-gateway v3.2: rendering multi-service configuration from $SERVICES_CONFIG" >&2
   python3 /opt/pq-gateway/bin/render_gateway_config.py \
     --config "$SERVICES_CONFIG" \
     --output /tmp/pq-gateway/nginx.conf \
@@ -73,4 +73,17 @@ EOF
 fi
 
 /opt/nginx/sbin/nginx -t -c /tmp/pq-gateway/nginx.conf
+
+if [ "${PQ_CONTROL_ENABLED:-false}" = "true" ]; then
+  echo "pq-gateway v3.2: starting gateway-agent" >&2
+  python3 /opt/pq-gateway/gateway/agent.py watch \
+    --control-dir "${PQ_CONTROL_DIR:-/var/lib/pq-control}" \
+    --active-config /tmp/pq-gateway/nginx.conf \
+    --db "${PQ_CONTROL_DB:-/var/lib/pq-control/control-plane.db}" \
+    --health-command "${PQ_AGENT_HEALTH_COMMAND:-}" \
+    --signing-key "${PQ_CONFIG_SIGNING_KEY:-}" \
+    --agent-id "${PQ_AGENT_ID:-}" \
+    --interval "${PQ_AGENT_INTERVAL:-2}" &
+fi
+
 exec /opt/nginx/sbin/nginx -g 'daemon off;' -c /tmp/pq-gateway/nginx.conf
