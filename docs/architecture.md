@@ -1,9 +1,9 @@
 # Architecture
 
-PQC Migration Gateway v3.2 separates discovery, persistent control-plane state and traffic execution.
+PQC Migration Gateway v3.3 separates enterprise crypto discovery, persistent control-plane state and traffic execution.
 
 ```text
-Files / CMDB / endpoints / CIDR
+Source / binaries / JAR / processes / CMDB / endpoints / CIDR
                 |
                 v
 Discovery + inventory + risk assessment
@@ -29,6 +29,13 @@ Discovery + inventory + risk assessment
 - `config-store` keeps resources, immutable staged artifacts, release status history, agents, runtime metrics and audit events.
 - the migration state machine rejects invalid lifecycle jumps.
 - releases contain canonical source, rendered NGINX configuration and a manifest.
+
+## Discovery plane
+
+- language adapters identify exact cryptographic API/method references;
+- artifact inspection reads file magic, symbols, dependencies and bounded strings/class constants without executing targets;
+- optional process-map inspection correlates deployed programs with cryptographic libraries;
+- CMDB, CIDR and online TLS collectors provide ownership and observed protocol evidence.
 
 ## Data plane
 

@@ -8,3 +8,5 @@
 6. Enable upstream certificate verification for non-demo HTTPS systems.
 7. Add every exposed listener to the Compose/Kubernetes service definition and firewall policy.
 8. Export JSON logs and inventory results to SIEM/CMDB systems.
+9. Run source/rootfs scans with bounded inputs and explicit authorization; enable `/proc` scanning only on approved hosts.
+10. Treat string-only binary hits as leads and correlate them with symbols, process maps and online TLS observations.

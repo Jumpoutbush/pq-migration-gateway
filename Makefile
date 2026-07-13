@@ -1,9 +1,9 @@
 SHELL := /usr/bin/env bash
-IMAGE := pq-migration-gateway-pq-gateway:3.2
+IMAGE := pq-migration-gateway-pq-gateway:3.3
 WSL_PROXY ?= http://127.0.0.1:7897
 INIT_ARGS ?=
 
-.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test mtls-test upstream-test stream-test inventory cmdb-import discover tls-scan continuous-scan metrics performance experiment clean zip
+.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test mtls-test upstream-test stream-test inventory enterprise-inventory enterprise-scan-test cmdb-import discover tls-scan continuous-scan metrics performance experiment clean zip
 
 init:
 	./init_system.sh $(INIT_ARGS)
@@ -78,6 +78,12 @@ stream-test:
 inventory:
 	python3 scripts/crypto_inventory.py --root ./certs --root ./gateway --root ./backend --root ./config --root ./docker-compose.yml --root ./scripts --root ./scanner --root ./manager --out-json crypto-inventory.json --out-csv crypto-inventory.csv
 
+enterprise-inventory:
+	python3 scripts/crypto_inventory.py --root /opt --root /usr/local --root /etc --scan-processes --proc-root /proc --out-json enterprise-crypto-inventory.json --out-csv enterprise-crypto-inventory.csv
+
+enterprise-scan-test:
+	python3 scripts/test_enterprise_scanner.py experiment-results/manual-enterprise-scan
+
 cmdb-import:
 	PYTHONPATH=scanner python3 scanner/cmdb_import.py --input config/cmdb/sample-assets.csv --out-json cmdb-targets.json --out-csv cmdb-targets.csv
 
@@ -102,15 +108,21 @@ performance:
 experiment:
 	./scripts/run_full_experiment.sh
 
+experiment-latest:
+	./scripts/run_full_experiment.sh --latest
+
 clean:
 	rm -f certs/*.crt certs/*.key certs/*.csr certs/*.srl certs/*.ext
 	rm -rf certs/upstream certs/untrusted certs/mldsa-demo
-	rm -f crypto-inventory.json crypto-inventory.csv tls-inventory.json tls-inventory.csv risk-report.json cmdb-targets.json cmdb-targets.csv network-discovery.json network-discovery.csv
+	rm -f crypto-inventory.json crypto-inventory.csv enterprise-crypto-inventory.json enterprise-crypto-inventory.csv tls-inventory.json tls-inventory.csv risk-report.json cmdb-targets.json cmdb-targets.csv network-discovery.json network-discovery.csv
 	rm -rf experiment-results runtime-data/logs/*.log runtime-data/metrics/* runtime-data/scans/*
 	rm -rf runtime-data/control/*
 	touch runtime-data/logs/.gitkeep runtime-data/metrics/.gitkeep runtime-data/scans/.gitkeep runtime-data/control/.gitkeep
 
 zip:
-	cd .. && zip -r pq-migration-gateway-v3.2.zip pq-migration-gateway-v3 \
+	cd .. && zip -r pq-migration-gateway-v3.3.1.zip pq-migration-gateway-v3 \
 	  -x '*/.git/*' '*/experiment-results/*' '*/runtime-data/logs/*.log' \
-	     '*/runtime-data/metrics/*' '*/runtime-data/scans/*' '*/runtime-data/control/*' '*/certs/*.key' '*/certs/*.crt'
+	     '*/runtime-data/metrics/*' '*/runtime-data/scans/*' '*/runtime-data/control/*' \
+	     '*/certs/*.key' '*/certs/*.crt' '*/certs/*.csr' '*/certs/*.srl' \
+	     '*/certs/**/*.key' '*/certs/**/*.crt' '*/certs/**/*.csr' '*/certs/**/*.srl' \
+	     '*/outputs/*' '*/__pycache__/*' '*.pyc' '*/.env'

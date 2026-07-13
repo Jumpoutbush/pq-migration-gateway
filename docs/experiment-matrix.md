@@ -32,6 +32,17 @@
 - generic TCP TLS echo;
 - non-HTTP legacy line protocol.
 
+## Enterprise crypto discovery
+
+- C/C++, Java, Rust, Go, Python and Shell source interface methods;
+- ELF dynamic symbols and bounded marker strings;
+- JAR JSSE/JCA/Bouncy Castle class constants;
+- extensionless Python and Shell executables;
+- Linux process-to-libssl/libcrypto mapping through a deterministic fake `/proc`;
+- JSON/CSV inventory and schema v2 compatibility fields;
+- target non-execution trap;
+- SQLite artifact/process persistence and risk correlation in offline regression tests.
+
 ## Performance
 
 - Hybrid/PQC and X25519 handshake latency, P50/P95/P99 and throughput;

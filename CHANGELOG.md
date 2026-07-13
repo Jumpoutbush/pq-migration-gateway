@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.3.1
+
+- Fixed the enterprise experiment assertion to accept Go and Rust interface evidence from either real compiled ELF symbol tables or bounded binary strings.
+- No scanner capability or gateway TLS policy changed.
+
+## 3.3.0
+
+### Enterprise Crypto Discovery
+
+- Added language-aware cryptographic interface discovery for C/C++, Java, Rust, Go, Python and Shell.
+- Added non-executing ELF, PE, Mach-O, archive and JAR inspection using file magic, dependencies, symbols and bounded strings/class constants.
+- Added optional Linux `/proc` correlation for processes that map cryptographic libraries.
+- Added schema v3 artifact, interface-method, confidence and runtime-process records while preserving v2 JSON compatibility fields.
+- Extended SQLite inventory and risk correlation for source, binary and runtime evidence.
+- Added a deterministic 15-case enterprise scanner experiment to the full experiment suite.
+- Preserved the v3.2 control-plane service schema and `X25519MLKEM768:X25519` compatibility policy.
+
 ## 3.2.0
 
 ### Control Plane Runtime

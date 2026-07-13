@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticated v3.2 REST API for Gateway control-plane resources."""
+"""Authenticated v3.3 REST API for Gateway control-plane resources."""
 from __future__ import annotations
 
 import argparse
@@ -97,7 +97,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if self.command == "GET" and path == "/healthz":
             latest = self.store.latest_version()
-            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.2.0", "latest_config": latest["version"] if latest else None})
+            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.3.1", "latest_config": latest["version"] if latest else None})
         elif self.command == "GET" and path == "/metrics":
             self.reply_text(200, self.store.prometheus_text(), "text/plain; version=0.0.4; charset=utf-8")
         elif self.command == "GET" and path == "/v1/metrics":
@@ -218,7 +218,7 @@ def main() -> int:
     ApiHandler.token = args.token
     ApiHandler.metrics_public = not args.private_metrics
     server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
-    print(f"manager-api v3.2 listening on {args.host}:{args.port}", file=sys.stderr)
+    print(f"manager-api v3.3 listening on {args.host}:{args.port}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

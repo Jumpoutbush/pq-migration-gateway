@@ -54,14 +54,14 @@ def assess_endpoint(endpoint: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--static", default="")
+    parser.add_argument("--static", action="append", default=[])
     parser.add_argument("--tls", default="")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
     findings: list[dict] = []
-    if args.static:
-        static = json.loads(Path(args.static).read_text(encoding="utf-8"))
+    for static_path in args.static:
+        static = json.loads(Path(static_path).read_text(encoding="utf-8"))
         for asset in static.get("assets", []):
             findings.append({
                 "finding_id": "risk-" + asset["asset_id"],
@@ -71,6 +71,26 @@ def main() -> int:
                 "reasons": [f"{asset['asset_type']} uses {asset['algorithm'] or 'an unidentified algorithm'}."],
                 "recommendations": [asset["recommendation"]],
                 "metadata": {"pq_status": asset["pq_status"], "deployment_status": asset["deployment_status"]},
+            })
+        for evidence in static.get("evidence", []):
+            if evidence.get("risk") == "INFO" and evidence.get("confidence") != "HIGH":
+                continue
+            method = evidence.get("method") or evidence.get("algorithm") or "unidentified interface"
+            findings.append({
+                "finding_id": "risk-" + evidence["evidence_id"],
+                "category": "crypto_usage",
+                "target": f"{evidence['path']}:{evidence.get('line', 0)}",
+                "risk": evidence.get("risk", "INFO"),
+                "reasons": [f"{evidence.get('language') or 'configuration'} uses {method} ({evidence.get('library') or 'library unknown'})."],
+                "recommendations": [evidence.get("recommendation") or "Associate this cryptographic use with its owning service and migration plan."],
+                "metadata": {
+                    "pq_status": evidence.get("pq_status"),
+                    "method": method,
+                    "library": evidence.get("library"),
+                    "confidence": evidence.get("confidence", "MEDIUM"),
+                    "evidence_source": evidence.get("source"),
+                    "artifact_id": evidence.get("artifact_id"),
+                },
             })
     if args.tls:
         tls = json.loads(Path(args.tls).read_text(encoding="utf-8"))

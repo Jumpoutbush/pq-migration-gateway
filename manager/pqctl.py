@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Administrative CLI for v3.2 control-plane resources and releases."""
+"""Administrative CLI for v3.3 control-plane resources and releases."""
 from __future__ import annotations
 
 import argparse

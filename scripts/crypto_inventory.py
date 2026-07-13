@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Dependency-light static cryptographic asset inventory scanner.
+"""Enterprise cryptographic asset, source, executable and runtime scanner.
 
-Version 2 separates concrete assets from source/configuration evidence, assigns
-stable IDs, recognises RSA private keys, and never stores private-key material.
+Schema v3 preserves the v2 assets/evidence/findings fields while adding
+language-aware API discovery, bounded binary/JAR inspection and optional
+runtime process linkage. Targets are never executed and private-key material is
+never persisted.
 """
 from __future__ import annotations
 
@@ -10,15 +12,32 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scanner.enterprise_inventory import (  # noqa: E402
+    CONFIG_EXTENSIONS,
+    DEFAULT_EXCLUDES,
+    SOURCE_FILENAMES,
+    SOURCE_LANGUAGES,
+    artifact_dict,
+    inspect_file,
+    process_dict,
+    scan_processes,
+)
+
 CERT_EXTS = {".crt", ".cer", ".pem"}
 KEY_EXTS = {".key", ".pem"}
-TEXT_EXTS = {".conf", ".cnf", ".cfg", ".ini", ".yaml", ".yml", ".json", ".properties", ".xml", ".txt", ".md", ".sh", ".py", ".go", ".java", ".js", ".ts", ".rs"}
+TEXT_EXTS = set(CONFIG_EXTENSIONS) | set(SOURCE_LANGUAGES)
 
 # Order matters: PQC/hybrid must be recognised before generic DSA/ECDH tokens.
 PATTERNS = [
@@ -68,6 +87,14 @@ class Evidence:
     risk: str = "INFO"
     pq_status: str = "unknown"
     recommendation: str = ""
+    language: str = ""
+    method: str = ""
+    library: str = ""
+    confidence: str = "MEDIUM"
+    artifact_type: str = ""
+    source: str = "generic_regex"
+    artifact_id: str = ""
+    metadata: dict = field(default_factory=dict)
 
 
 def stable_id(prefix: str, *parts: object) -> str:
@@ -75,9 +102,16 @@ def stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}-" + hashlib.sha256(blob.encode()).hexdigest()[:20]
 
 
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return number
+
+
 def run(cmd: list[str], timeout: int = 8) -> tuple[int, str]:
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 124, str(exc)
     return proc.returncode, (proc.stdout + b"\n" + proc.stderr).decode("utf-8", "replace")
@@ -169,15 +203,18 @@ def safe_text(path: Path, max_bytes: int) -> str | None:
     try:
         if path.stat().st_size > max_bytes:
             return None
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
     except OSError:
+        return None
+    if len(raw) > max_bytes:
         return None
     if b"\x00" in raw[:4096]:
         return None
     return raw.decode("utf-8", "replace")
 
 
-def scan_text(path: Path, max_bytes: int) -> list[Evidence]:
+def scan_text(path: Path, max_bytes: int, artifact_id: str = "", max_evidence: int = 2_000) -> list[Evidence]:
     text = safe_text(path, max_bytes)
     if text is None:
         return []
@@ -197,20 +234,33 @@ def scan_text(path: Path, max_bytes: int) -> list[Evidence]:
                 path=str(path.resolve()), line=number, evidence_type="text_crypto_reference",
                 algorithm=algorithm, excerpt=excerpt, risk=risk, pq_status=status,
                 recommendation=recommendation,
+                language=SOURCE_LANGUAGES.get(path.suffix.lower(), SOURCE_FILENAMES.get(path.name, "config")),
+                confidence="MEDIUM", artifact_type="source_or_configuration",
+                source="generic_algorithm_regex", artifact_id=artifact_id,
             ))
+            if len(output) >= max_evidence:
+                return output
     return output
 
 
-def iter_files(roots: list[Path]):
+def iter_files(roots: list[Path], excludes: set[str], max_files: int):
     seen: set[Path] = set()
+    emitted = 0
     for root in roots:
         if root.is_file():
             candidates = [root]
         elif root.is_dir():
-            candidates = (p for p in root.rglob("*") if p.is_file())
+            def walk_files():
+                for directory, names, files in os.walk(root, topdown=True, followlinks=False, onerror=lambda _error: None):
+                    names[:] = [name for name in names if name not in excludes and not (Path(directory) / name).is_symlink()]
+                    for name in files:
+                        yield Path(directory) / name
+            candidates = walk_files()
         else:
             continue
         for path in candidates:
+            if path.is_symlink():
+                continue
             try:
                 resolved = path.resolve()
             except OSError:
@@ -218,13 +268,45 @@ def iter_files(roots: list[Path]):
             if resolved not in seen:
                 seen.add(resolved)
                 yield path
+                emitted += 1
+                if emitted >= max_files:
+                    return
+
+
+def evidence_from_signal(path: Path, signal: dict, artifact_id: str = "") -> Evidence:
+    algorithm = signal.get("algorithm", "unknown")
+    excerpt = signal.get("excerpt", "")[:500]
+    risk, status, recommendation = classify(algorithm, excerpt)
+    source = signal.get("source", "source_parser")
+    deployment = "runtime_observed" if source == "proc_maps" else "binary_reference" if signal.get("artifact_type") in {"native_executable", "binary_archive", "java_archive"} else "source_reference"
+    evidence_path = Path(signal.get("path", path))
+    line = int(signal.get("line", 0))
+    return Evidence(
+        evidence_id=stable_id("evidence", evidence_path, line, algorithm, signal.get("method", ""), source),
+        path=str(evidence_path.resolve()), line=line,
+        evidence_type=signal.get("evidence_type", "crypto_interface"), algorithm=algorithm,
+        excerpt=excerpt, deployment_status=deployment, risk=risk, pq_status=status,
+        recommendation=recommendation, language=signal.get("language", ""),
+        method=signal.get("method", ""), library=signal.get("library", ""),
+        confidence=signal.get("confidence", "MEDIUM"),
+        artifact_type=signal.get("artifact_type", ""), source=source,
+        artifact_id=artifact_id, metadata=signal.get("metadata", {}),
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", action="append", required=True)
     parser.add_argument("--openssl", default="openssl")
-    parser.add_argument("--max-text-bytes", type=int, default=2_000_000)
+    parser.add_argument("--max-text-bytes", type=positive_int, default=2_000_000)
+    parser.add_argument("--max-binary-bytes", type=positive_int, default=64_000_000)
+    parser.add_argument("--max-files", type=positive_int, default=100_000)
+    parser.add_argument("--max-evidence-per-file", type=positive_int, default=2_000)
+    parser.add_argument("--exclude", action="append", default=[], help="Directory name to exclude; may be repeated")
+    parser.add_argument("--scan-processes", action="store_true", help="Inspect /proc process maps without executing targets")
+    parser.add_argument("--proc-root", default="/proc", help="Alternate proc filesystem root for process inspection/tests")
+    parser.add_argument("--max-processes", type=positive_int, default=20_000)
+    parser.add_argument("--include-command-lines", action="store_true", help="Collect redacted process command lines; disabled by default")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--out-csv", required=True)
     args = parser.parse_args()
@@ -232,7 +314,19 @@ def main() -> int:
     roots = [Path(x) for x in args.root]
     assets: dict[str, Asset] = {}
     evidence: dict[str, Evidence] = {}
-    for path in iter_files(roots):
+    artifacts: dict[str, dict] = {}
+    scan_stats = {"files_seen": 0, "source_files_inspected": 0, "binary_files_inspected": 0, "files_skipped": 0}
+    excludes = set(DEFAULT_EXCLUDES) | set(args.exclude)
+    scanner_implementation_files = {
+        Path(__file__).resolve(),
+        (PROJECT_ROOT / "scanner/enterprise_inventory.py").resolve(),
+        (PROJECT_ROOT / "scripts/build_enterprise_scan_fixtures.py").resolve(),
+        (PROJECT_ROOT / "scripts/test_enterprise_scanner.py").resolve(),
+    }
+    for path in iter_files(roots, excludes, args.max_files):
+        scan_stats["files_seen"] += 1
+        if path.resolve() in scanner_implementation_files:
+            continue
         suffix = path.suffix.lower()
         if suffix in CERT_EXTS:
             cert = parse_certificate(path, args.openssl)
@@ -242,38 +336,87 @@ def main() -> int:
             key = identify_private_key(path, args.openssl)
             if key:
                 assets[key.asset_id] = key
-        if suffix in TEXT_EXTS or path.name in {"Dockerfile", "Makefile"}:
-            for item in scan_text(path, args.max_text_bytes):
+        artifact, signals, inspected = inspect_file(path, args.max_text_bytes, args.max_binary_bytes, args.max_evidence_per_file)
+        if inspected.get("kind") == "source":
+            scan_stats["source_files_inspected"] += 1
+        elif inspected.get("kind") == "binary":
+            scan_stats["binary_files_inspected"] += 1
+        elif inspected.get("skipped"):
+            scan_stats["files_skipped"] += 1
+        artifact_id = artifact.artifact_id if artifact else ""
+        if artifact:
+            artifacts[artifact.artifact_id] = artifact_dict(artifact)
+        for signal in signals:
+            item = evidence_from_signal(path, signal, artifact_id)
+            evidence[item.evidence_id] = item
+        if suffix in TEXT_EXTS or path.name in SOURCE_FILENAMES or (inspected.get("kind") == "source"):
+            for item in scan_text(path, args.max_text_bytes, artifact_id, args.max_evidence_per_file):
                 evidence[item.evidence_id] = item
+
+    runtime_rows: list[dict] = []
+    process_stats = {"inspected": 0, "denied": 0, "crypto_processes": 0}
+    if args.scan_processes:
+        processes, runtime_signals, process_stats = scan_processes(Path(args.proc_root), args.max_processes, args.include_command_lines)
+        runtime_rows = [process_dict(item) for item in processes]
+        for signal in runtime_signals:
+            item = evidence_from_signal(Path(signal["path"]), signal)
+            evidence[item.evidence_id] = item
 
     asset_rows = [asdict(x) for x in sorted(assets.values(), key=lambda x: (x.asset_type, x.path))]
     evidence_rows = [asdict(x) for x in sorted(evidence.values(), key=lambda x: (x.path, x.line, x.algorithm))]
+    artifact_rows = sorted(artifacts.values(), key=lambda x: (x["artifact_type"], x["path"]))
     risks = [x["risk"] for x in asset_rows + evidence_rows]
+    languages = [item["language"] for item in evidence_rows if item.get("language") and item["language"] != "config"]
+    confidence = [item.get("confidence", "MEDIUM") for item in evidence_rows]
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "scanner_version": "3.3.1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "roots": [str(p.resolve()) for p in roots],
         "summary": {
             "concrete_assets": len(asset_rows),
             "source_evidence": len(evidence_rows),
+            "interface_evidence": sum(x["evidence_type"] != "text_crypto_reference" for x in evidence_rows),
+            "configuration_references": sum(x["evidence_type"] == "text_crypto_reference" for x in evidence_rows),
+            "crypto_relevant_artifacts": len(artifact_rows),
+            "native_executables": sum(x["artifact_type"] == "native_executable" for x in artifact_rows),
+            "java_archives": sum(x["artifact_type"] == "java_archive" for x in artifact_rows),
+            "java_classes": sum(x["artifact_type"] == "java_class" for x in artifact_rows),
+            "runtime_crypto_processes": len(runtime_rows),
+            "files_seen": scan_stats["files_seen"],
+            "source_files_inspected": scan_stats["source_files_inspected"],
+            "binary_files_inspected": scan_stats["binary_files_inspected"],
+            "by_language": {name: languages.count(name) for name in sorted(set(languages))},
+            "by_confidence": {name: confidence.count(name) for name in ["HIGH", "MEDIUM", "LOW"]},
             "by_risk": {name: risks.count(name) for name in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]},
             "quantum_vulnerable_assets": sum(x["pq_status"] == "quantum_vulnerable" for x in asset_rows),
             "pqc_assets_or_references": sum(x["pq_status"] == "pqc_or_pqc_candidate" for x in asset_rows + evidence_rows),
         },
         "assets": asset_rows,
         "evidence": evidence_rows,
+        "artifacts": artifact_rows,
+        "runtime_processes": runtime_rows,
+        "scan_statistics": {"filesystem": scan_stats, "processes": process_stats, "excluded_directory_names": sorted(excludes)},
         # Compatibility field for tools that consumed v1 findings.
         "findings": asset_rows + evidence_rows,
     }
-    Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    with Path(args.out_csv).open("w", encoding="utf-8", newline="") as handle:
-        fields = ["record_kind", "id", "path", "type", "algorithm", "key_bits", "line", "deployment_status", "risk", "pq_status", "recommendation", "excerpt"]
+    json_path = Path(args.out_json)
+    csv_path = Path(args.out_csv)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        fields = ["record_kind", "id", "path", "type", "algorithm", "key_bits", "line", "deployment_status", "risk", "pq_status", "recommendation", "excerpt", "language", "method", "library", "confidence", "artifact_type", "source", "metadata"]
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for item in asset_rows:
-            writer.writerow({"record_kind": "asset", "id": item["asset_id"], "path": item["path"], "type": item["asset_type"], "algorithm": item["algorithm"], "key_bits": item["key_bits"], "line": "", "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item.get("metadata", {}).get("evidence", "")})
+            writer.writerow({"record_kind": "asset", "id": item["asset_id"], "path": item["path"], "type": item["asset_type"], "algorithm": item["algorithm"], "key_bits": item["key_bits"], "line": "", "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item.get("metadata", {}).get("evidence", ""), "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
         for item in evidence_rows:
-            writer.writerow({"record_kind": "evidence", "id": item["evidence_id"], "path": item["path"], "type": item["evidence_type"], "algorithm": item["algorithm"], "key_bits": "", "line": item["line"], "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item["excerpt"]})
+            writer.writerow({"record_kind": "evidence", "id": item["evidence_id"], "path": item["path"], "type": item["evidence_type"], "algorithm": item["algorithm"], "key_bits": "", "line": item["line"], "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item["excerpt"], "language": item["language"], "method": item["method"], "library": item["library"], "confidence": item["confidence"], "artifact_type": item["artifact_type"], "source": item["source"], "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
+        for item in artifact_rows:
+            writer.writerow({"record_kind": "artifact", "id": item["artifact_id"], "path": item["path"], "type": item["file_format"], "algorithm": "", "key_bits": "", "line": "", "deployment_status": "present", "risk": "", "pq_status": "", "recommendation": "", "excerpt": ";".join(item.get("dependencies", [])), "language": ";".join(item.get("languages", [])), "method": ";".join(item.get("imported_symbols", [])), "library": "", "confidence": item["confidence"], "artifact_type": item["artifact_type"], "source": "artifact_inspection", "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
+        for item in runtime_rows:
+            writer.writerow({"record_kind": "runtime_process", "id": item["process_id"], "path": item["executable"], "type": "process", "algorithm": "runtime-selected", "key_bits": "", "line": "", "deployment_status": "runtime_observed", "risk": "INFO", "pq_status": "unknown", "recommendation": "Correlate the mapped library with application ownership and runtime TLS observations.", "excerpt": item["command"], "language": "runtime", "method": ";".join(item["mapped_crypto_libraries"]), "library": ";".join(item["mapped_crypto_libraries"]), "confidence": item["confidence"], "artifact_type": "runtime_process", "source": "proc_maps", "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
     print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
     return 0
 

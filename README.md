@@ -1,4 +1,4 @@
-# PQC Migration Gateway v3.2 — Control Plane Runtime
+# PQC Migration Gateway v3.3 — Enterprise Crypto Discovery
 
 一个面向异构存量系统的后量子迁移基础设施原型。项目不实现具体金融业务，而是提供：
 
@@ -11,7 +11,7 @@
 - 持续扫描、配置验证、运行时回退统计；
 - 完整功能与性能实验。
 
-v3.2 把 v3.1 的框架核心升级为可持续运行的控制面：Service、Policy、ConfigVersion、GatewayAgent、MigrationState、AuditEvent 与 RuntimeMetric 都成为持久化资源；管理 API 提供资源 CRUD、发布、回滚、心跳和指标接口；发布过程拥有完整状态流水。旧 v3 配置和 v3.1 的统一模型仍可读取，默认配置继续使用 `schema_version: 4.0`。
+v3.3 在 v3.2 控制面运行时上增加企业密码资产发现：按语言识别 C/C++、Java、Rust、Go、Python、Shell 的密码接口方法；按文件魔数检查 ELF、PE、Mach-O、静态库和 JAR；可选关联 Linux 运行进程映射的密码库。扫描器不执行目标程序。旧 v3 配置、v3.1 统一模型和 v3.2 控制面资源仍兼容，默认服务配置继续使用 `schema_version: 4.0`。
 
 网关使用 **NGINX 1.28.0 + OpenSSL 3.5.0**。默认迁移策略为：
 
@@ -23,7 +23,7 @@ X25519MLKEM768:X25519
 
 ---
 
-## 1. v3.2 功能
+## 1. v3.3 功能
 
 ### 1.0 控制面运行时
 
@@ -54,6 +54,12 @@ X25519MLKEM768:X25519
 支持：
 
 - X.509 证书、私钥、TLS 配置和源码引用扫描；
+- C/C++、Java、Rust、Go、Python、Shell 接口/方法级识别；
+- ELF/PE/Mach-O/静态库的依赖、导入符号和受限字符串检查；
+- JAR/WAR/EAR 类常量检查，不加载或执行 Java 类；
+- 无扩展名脚本和按文件魔数识别的原生可执行程序；
+- 可选 `/proc/<pid>/maps` 运行进程与密码库关联；
+- 证据置信度、来源、语言、库、方法、算法和制品 SHA-256；
 - 单端点和批量端点输入；
 - CSV/JSON CMDB 资产导入；
 - CIDR 网段与端口发现；
@@ -103,6 +109,7 @@ runtime-data/metrics/pqc_gateway.prom
 - TCP echo；
 - 非 HTTP 遗留行协议；
 - 静态资产扫描、CMDB 导入、CIDR 发现和持续扫描；
+- 六种语言、ELF/JAR、无扩展名程序和进程映射的企业扫描矩阵；
 - 风险评估、SQLite 导入和策略验证；
 - 持久化回退统计；
 - 握手、HTTP、TCP、遗留协议和 MQTT 性能测试。
@@ -229,7 +236,7 @@ docker build \
   --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
   --build-arg no_proxy=localhost,127.0.0.1,::1 \
   -f docker/Dockerfile.gateway \
-  -t pq-migration-gateway-pq-gateway:3.2 \
+  -t pq-migration-gateway-pq-gateway:3.3 \
   .
 ```
 
@@ -371,6 +378,14 @@ curl --noproxy '*' \
 ./scripts/run_full_experiment.sh
 ```
 
+同时维护最新实验指针：
+
+```bash
+./scripts/run_full_experiment.sh --latest
+cat experiment-results/latest/experiment-status.json
+cat experiment-results/latest/SUMMARY.md
+```
+
 需要重新构建：
 
 ```bash
@@ -392,7 +407,7 @@ PERF_PROFILE=stress ./scripts/run_full_experiment.sh
 成功标志：
 
 ```text
-All v3.2 experiments completed: experiment-results/<UTC时间戳>
+All v3.3 experiments completed: experiment-results/<UTC时间戳>
 ```
 
 并生成：
@@ -405,6 +420,10 @@ experiment-results/<UTC时间戳>/
 ├── upstream/upstream-tls-matrix.json
 ├── stream/stream-protocol-matrix.json
 ├── crypto-inventory.json
+├── enterprise-scan/
+│   ├── enterprise-scanner-matrix.json
+│   ├── enterprise-crypto-inventory.json
+│   └── enterprise-crypto-inventory.csv
 ├── tls-inventory.json
 ├── cmdb-targets.json
 ├── network-discovery.json
@@ -428,6 +447,13 @@ experiment-results/<UTC时间戳>/
 latest="$(ls -1dt experiment-results/*/ | head -1)"
 cat "$latest/experiment-status.json"
 cat "$latest/SUMMARY.md"
+```
+
+如果运行时使用了 `--latest`，也可以固定查看：
+
+```bash
+cat experiment-results/latest/experiment-status.json
+cat experiment-results/latest/SUMMARY.md
 ```
 
 ---
@@ -511,6 +537,35 @@ make stream-test
 ```
 
 适用于数据库、消息队列、设备协议和其他 TCP 系统。协议本身仍由后端处理。
+
+---
+
+## 11.1 企业源码、可执行程序与运行态扫描
+
+项目目录扫描：
+
+```bash
+make inventory
+```
+
+宿主机部署路径和运行进程扫描（仅对已授权主机执行）：
+
+```bash
+make enterprise-inventory
+```
+
+输出 `enterprise-crypto-inventory.json` 和 `.csv`，包含源码接口方法、
+ELF/PE/JAR 制品、动态依赖、导入符号、SHA-256、证据置信度及进程映射。
+扫描器按文件魔数识别二进制，不执行目标程序，也不保存私钥内容。
+
+单独运行 15 项确定性实验：
+
+```bash
+make enterprise-scan-test
+cat experiment-results/manual-enterprise-scan/enterprise-scanner-matrix.json
+```
+
+详细说明见 `docs/enterprise-scanning.md`。
 
 ---
 
@@ -820,7 +875,7 @@ python3 manager/pqctl.py metrics prometheus
 
 ## 20. 项目边界
 
-v3.2 已提供单节点控制面运行时与安全发布闭环，但仍是框架原型，不是生产网关成品。生产化仍需：
+v3.3 已提供单节点控制面运行时、安全发布闭环和非执行式企业密码资产发现，但仍是框架原型，不是生产网关成品。生产化仍需：
 
 - 银行或企业 PKI；
 - HSM/KMS；

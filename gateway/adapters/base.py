@@ -44,39 +44,24 @@ def upstream_tls_lines(service: dict, stream: bool = False) -> list[str]:
     prefix = "proxy_ssl"
     tls = service["upstream"]["tls"]
     lines: list[str] = []
-
     if stream:
         lines.append(f"        {prefix} {'on' if tls['enabled'] else 'off'};")
-
-    if not tls["enabled"]:
-        return lines
-
+        if not tls["enabled"]:
+            return lines
+    if tls["enabled"]:
+        lines.append("        proxy_ssl_session_reuse off;")
     lines.append("        proxy_ssl_protocols TLSv1.2 TLSv1.3;")
-    lines.append("        proxy_ssl_session_reuse off;")
-    lines.append(
-        f"        proxy_ssl_server_name {'on' if tls['sni'] else 'off'};"
-    )
-
+    lines.append(f"        proxy_ssl_server_name {'on' if tls['sni'] else 'off'};")
     if tls["sni"]:
         lines.append(f"        proxy_ssl_name {tls['sni']};")
-
-    lines.append(
-        f"        proxy_ssl_verify {'off' if tls['verify'] == 'off' else 'on'};"
-    )
-
+    lines.append(f"        proxy_ssl_verify {'off' if tls['verify'] == 'off' else 'on'};")
     if tls["verify"] != "off":
-        lines.extend([
-            f"        proxy_ssl_trusted_certificate {tls['ca']};",
-            "        proxy_ssl_verify_depth 3;",
-        ])
-
+        lines.extend([f"        proxy_ssl_trusted_certificate {tls['ca']};", "        proxy_ssl_verify_depth 3;"])
     identity = tls["client_identity"]
     if identity["certificate"]:
         lines.extend([
             f"        proxy_ssl_certificate {identity['certificate']};",
-            f"        proxy_ssl_certificate_key "
-            f"{identity['private_key']['reference']};",
+            f"        proxy_ssl_certificate_key {identity['private_key']['reference']};",
         ])
-
     return lines
 

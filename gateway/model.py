@@ -193,7 +193,7 @@ def normalize_config(config: dict) -> dict:
         if not isinstance(private_key, dict):
             raise ConfigError(f"{service_id}.downstream_tls.private_key must be an object")
         if private_key.get("provider", "file") != "file":
-            raise ConfigError("NGINX v3.2 data plane currently renders file private-key references only")
+            raise ConfigError("NGINX v3.3 data plane currently renders file private-key references only")
         key_ref = _string(private_key.get("reference"), f"{service_id}.downstream_tls.private_key.reference")
         client_ca = _string(downstream.get("client_ca", defaults.get("client_ca")), f"{service_id}.client_ca")
 
@@ -213,7 +213,7 @@ def normalize_config(config: dict) -> dict:
         upstream_ca = _string(tls.get("ca", defaults.get("upstream_ca")), f"{service_id}.upstream.tls.ca")
         identity = _identity(tls.get("client_identity"), f"{service_id}.upstream.tls.client_identity")
         if identity["private_key"]["provider"] != "file" and identity["certificate"]:
-            raise ConfigError("NGINX v3.2 data plane currently renders file upstream identity references only")
+            raise ConfigError("NGINX v3.3 data plane currently renders file upstream identity references only")
 
         timeouts = raw.get("timeouts", {})
         if not isinstance(timeouts, dict):
