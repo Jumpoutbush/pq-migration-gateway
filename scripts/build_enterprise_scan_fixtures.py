@@ -14,11 +14,14 @@ from pathlib import Path
 
 SOURCES = {
     "service.cpp": """#include <openssl/ssl.h>
-void configure_tls() {
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+#define CREATE_TLS(method) SSL_CTX_new(method)
+void *configure_tls() {
+    SSL_CTX *ctx = CREATE_TLS(TLS_client_method());
     EVP_PKEY_encrypt(nullptr, nullptr, nullptr, nullptr, 0);
-    (void)ctx;
+    RSA_public_encrypt(0, nullptr, nullptr, nullptr, 0);
+    return ctx;
 }
+void *migration_wrapper() { return configure_tls(); }
 """,
     "CryptoService.java": """import javax.crypto.Cipher;
 import javax.net.ssl.SSLContext;
@@ -56,6 +59,10 @@ def write_sources(root: Path) -> None:
         path.write_text(text, encoding="utf-8")
         if path.suffix in {".py", ".sh"}:
             path.chmod(0o755)
+    (root / "compile_commands.json").write_text(json.dumps([{
+        "directory": str(root.resolve()), "file": "service.cpp",
+        "arguments": ["g++", "-std=c++20", "-DPQ_SCAN_FIXTURE=1", "-Iinclude", "-c", "service.cpp"],
+    }], indent=2) + "\n", encoding="utf-8")
 
 
 def build_native(root: Path) -> tuple[Path, str]:
@@ -80,6 +87,27 @@ def build_native(root: Path) -> tuple[Path, str]:
         mode = "synthetic_elf_markers"
     target.chmod(0o755)
     return target, mode
+
+
+def build_static_archive(root: Path) -> tuple[Path, str]:
+    target = root / "libcpp-crypto.a"
+    source = root / "static_crypto.cpp"
+    source.write_text(
+        'namespace CryptoPP { struct RSA { void Encrypt(); }; void RSA::Encrypt(){} }\n'
+        'extern "C" void SSL_CTX_new(); void use_ssl(){ SSL_CTX_new(); }\n',
+        encoding="utf-8",
+    )
+    compiler, archiver = shutil.which("g++"), shutil.which("ar")
+    if compiler and archiver:
+        obj = root / "static_crypto.o"
+        try:
+            subprocess.run([compiler, "-c", str(source), "-o", str(obj)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            subprocess.run([archiver, "rcs", str(target), str(obj)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            return target, "compiled_static_archive"
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+    target.write_bytes(b"!<arch>\n_ZN8CryptoPP3RSA7EncryptEv\x00SSL_CTX_new\x00")
+    return target, "static_archive_marker_fallback"
 
 
 def copy_marker_elf(base: Path, target: Path, markers: bytes) -> None:
@@ -224,21 +252,31 @@ def build(output: Path) -> dict:
     output.mkdir(parents=True)
     write_sources(source_root)
     native, native_mode = build_native(binary_root)
+    static_archive, static_archive_mode = build_static_archive(binary_root)
     go_mode = build_go_binary(binary_root, native)
     rust_mode = build_rust_binary(binary_root, native)
     java_mode = build_jar(binary_root / "java-service.jar", binary_root)
     execution_marker = output / "TARGET_WAS_EXECUTED"
     build_executable_scripts(binary_root, execution_marker)
     build_fake_proc(proc_root)
+    ebpf_trace = output / "ebpf-trace.jsonl"
+    ebpf_trace.write_text(json.dumps({
+        "pid": 4242, "comm": "payment-service", "method": "RSA_public_encrypt",
+        "library": "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+    }) + "\n", encoding="utf-8")
     manifest = {
         "source_root": str(source_root.resolve()),
         "binary_root": str(binary_root.resolve()),
         "proc_root": str(proc_root.resolve()),
         "native_fixture_mode": native_mode,
+        "static_archive": str(static_archive.resolve()),
+        "static_archive_mode": static_archive_mode,
         "go_fixture_mode": go_mode,
         "rust_fixture_mode": rust_mode,
         "java_fixture_mode": java_mode,
         "execution_marker": str(execution_marker.resolve()),
+        "compile_commands": str((source_root / "compile_commands.json").resolve()),
+        "ebpf_trace": str(ebpf_trace.resolve()),
         "languages": ["cpp", "java", "rust", "go", "python", "shell"],
     }
     (output / "fixture-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

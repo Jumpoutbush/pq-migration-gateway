@@ -1,7 +1,14 @@
 #!/usr/bin/env sh
 set -eu
 
-mkdir -p /tmp/pq-gateway /var/log/nginx /var/cache/nginx/client_temp
+mkdir -p \
+  /tmp/pq-gateway \
+  /var/log/nginx \
+  /var/cache/nginx/client_temp \
+  /var/cache/nginx/proxy_temp \
+  /var/cache/nginx/fastcgi_temp \
+  /var/cache/nginx/uwsgi_temp \
+  /var/cache/nginx/scgi_temp
 
 : "${SERVICES_CONFIG:=/etc/pq-gateway/config/services.json}"
 : "${GATEWAY_LISTEN_PORT:=8443}"
@@ -20,7 +27,7 @@ mkdir -p /tmp/pq-gateway /var/log/nginx /var/cache/nginx/client_temp
 : "${UPSTREAM_READ_TIMEOUT:=60s}"
 
 if [ -f "$SERVICES_CONFIG" ]; then
-  echo "pq-gateway v3.3: rendering multi-service configuration from $SERVICES_CONFIG" >&2
+  echo "pq-gateway v3.6: rendering multi-service configuration from $SERVICES_CONFIG" >&2
   python3 /opt/pq-gateway/bin/render_gateway_config.py \
     --config "$SERVICES_CONFIG" \
     --output /tmp/pq-gateway/nginx.conf \
@@ -75,7 +82,7 @@ fi
 /opt/nginx/sbin/nginx -t -c /tmp/pq-gateway/nginx.conf
 
 if [ "${PQ_CONTROL_ENABLED:-false}" = "true" ]; then
-  echo "pq-gateway v3.3: starting gateway-agent" >&2
+  echo "pq-gateway v3.6: starting gateway-agent" >&2
   python3 /opt/pq-gateway/gateway/agent.py watch \
     --control-dir "${PQ_CONTROL_DIR:-/var/lib/pq-control}" \
     --active-config /tmp/pq-gateway/nginx.conf \

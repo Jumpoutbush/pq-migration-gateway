@@ -3,7 +3,7 @@
 v3.2 turns the v3.1 framework core into a persistent single-node control plane.
 
 ```text
-pqctl / manager-api
+Customer REST / pqapi / offline pqctl
         |
         | Service, Policy, release, migration intent
         v
@@ -66,7 +66,11 @@ The Agent sequence is:
 6. Run the configured health check.
 7. Mark the release `HEALTHY`, or restore the prior file and record rollback.
 
-## CLI
+## Offline CLI (bootstrap and diagnostics)
+
+v3.6 customer day-2 operations use the Manager REST API. `pqctl` remains for
+offline initialization, development and recovery when the API itself is not
+available; it is not the normal enterprise integration boundary.
 
 Validate and publish a complete document:
 
@@ -96,9 +100,9 @@ python3 manager/pqctl.py metrics prometheus
 python3 manager/pqctl.py migration history compatibility-gateway
 ```
 
-## REST API
+## REST API (primary customer interface in v3.6)
 
-The optional API binds to host loopback in Compose. Generate independent bearer and signing secrets before starting it:
+The enterprise API binds to host loopback by default. Generate independent bearer and signing secrets before starting it:
 
 ```bash
 export MANAGER_API_TOKEN="$(openssl rand -hex 32)"
@@ -128,6 +132,13 @@ Main endpoints:
 | POST | `/v1/services/{id}/transition` | Audited migration transition. |
 | GET | `/v1/audit` | Audit trail. |
 | GET | `/v1/metrics` | Metrics as JSON. |
+| POST/GET | `/v1/scans` | Create or list asynchronous enterprise scans. |
+| GET | `/v1/scans/{id}` | Scan status and summary. |
+| GET | `/v1/scans/{id}/findings` | Findings produced by one scan. |
+| GET | `/v1/assets` | Normalized certificates, keys and software artifacts. |
+| GET | `/v1/assets/{id}` | Asset evidence, assessments and migration plans. |
+| POST | `/v1/assets/{id}/assess` | Persist a migration-oriented risk assessment. |
+| POST | `/v1/assets/{id}/migration` | Create compatibility release, verify/promote strict, or complete. |
 
 All `/v1` endpoints require `Authorization: Bearer ...`. Operators should set `X-PQ-Operator` so audit records identify the caller. Use `--private-metrics` if `/metrics` must also require the bearer token.
 
@@ -159,4 +170,6 @@ gateway_connection_duration_seconds_count
 - SHA-256 always protects artifact integrity; HMAC-SHA-256 authenticates releases when `PQ_CONFIG_SIGNING_KEY` is configured on manager and Agent.
 - Private keys are references and are not stored in SQLite.
 - Business payloads are not stored in control-plane tables or metrics.
+- Scan roots are restricted by `PQ_SCAN_ALLOWED_ROOTS`; compile commands are parsed but never executed.
+- Process scanning and live eBPF observation are disabled unless the API administrator explicitly enables them.
 - This release remains single-node SQLite. PostgreSQL coordination, rolling multi-instance publication, certificate lifecycle and HSM/KMS providers are deferred.

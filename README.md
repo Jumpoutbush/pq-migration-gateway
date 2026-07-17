@@ -1,4 +1,4 @@
-# PQC Migration Gateway v3.3 — Enterprise Crypto Discovery
+# PQC Migration Gateway v3.6 — API-First Enterprise Control Plane
 
 一个面向异构存量系统的后量子迁移基础设施原型。项目不实现具体金融业务，而是提供：
 
@@ -11,7 +11,7 @@
 - 持续扫描、配置验证、运行时回退统计；
 - 完整功能与性能实验。
 
-v3.3 在 v3.2 控制面运行时上增加企业密码资产发现：按语言识别 C/C++、Java、Rust、Go、Python、Shell 的密码接口方法；按文件魔数检查 ELF、PE、Mach-O、静态库和 JAR；可选关联 Linux 运行进程映射的密码库。扫描器不执行目标程序。旧 v3 配置、v3.1 统一模型和 v3.2 控制面资源仍兼容，默认服务配置继续使用 `schema_version: 4.0`。
+v3.6 将企业启动后的控制操作统一为 REST API：服务接入与原子发布、扫描、资产评估、迁移、发布历史、状态、审计和回滚都不再要求直接操作 SQLite 或逐条执行内部命令。新增 OpenAPI 合同、能力发现、聚合状态和纯 REST Python 客户端；v3.5 企业部署与 Grafana、v3.4 扫描到迁移闭环继续兼容。
 
 网关使用 **NGINX 1.28.0 + OpenSSL 3.5.0**。默认迁移策略为：
 
@@ -23,18 +23,34 @@ X25519MLKEM768:X25519
 
 ---
 
-## 1. v3.3 功能
+## 1. v3.6 功能
 
-### 1.0 控制面运行时
+### 1.0 企业快速接入
+
+```bash
+make build
+make enterprise-init SCAN_ROOT="$PWD" SERVER_NAME=pqc-gateway.company.local LISTEN_PORT=28443
+make enterprise-up
+make enterprise-capabilities
+make enterprise-api-onboard SERVICE_FILE=customer-service.json
+make enterprise-scan
+make dashboard-up
+```
+
+企业运行环境不会启动演示银行、MQTT、TCP 或安全后端。API 合同在 `GET /openapi.json`，完整调用流程见 `docs/api-first.md` 和 `docs/enterprise-quickstart.md`。
+
+### 1.1 控制面运行时
 
 - Service 与 Policy 资源持久化、查询、更新和删除；
 - 配置发布状态：`DRAFT → VALIDATED → STAGED → APPLIED → HEALTHY`；
 - 验证、`nginx -t`、reload、健康检查失败分别记录；
 - Gateway Agent 心跳、当前/期望配置版本、健康和 reload 结果上报；
 - `/metrics` 暴露发布、Agent、TLS group、经典回退和 TLS/mTLS 错误指标；
-- `pqctl` 支持配置、资源、迁移、Agent 与指标管理。
+- `pqapi` 为纯 REST 自动化客户端；`pqctl` 仅保留离线初始化、开发和故障诊断用途；
+- REST API 支持异步扫描任务、资产/证据查询、风险评估和迁移计划；
+- 严格模式发布受兼容版本健康状态、验证结果和回退率共同约束。
 
-### 1.1 通用接入
+### 1.2 通用接入
 
 | 接入类型 | 实现方式 | 示例端口 |
 |---|---|---:|
@@ -49,16 +65,19 @@ X25519MLKEM768:X25519
 
 所有业务载荷均被视为不透明数据。新增系统主要通过 `config/services.json` 配置，不要求修改网关源码。
 
-### 1.2 企业密码资产发现
+### 1.3 企业密码资产发现
 
 支持：
 
 - X.509 证书、私钥、TLS 配置和源码引用扫描；
 - C/C++、Java、Rust、Go、Python、Shell 接口/方法级识别；
+- C++ 编译数据库元数据、有界宏展开和启发式调用关系；
 - ELF/PE/Mach-O/静态库的依赖、导入符号和受限字符串检查；
+- 静态库成员/符号及 C++ `c++filt` 名称反修饰；
 - JAR/WAR/EAR 类常量检查，不加载或执行 Java 类；
 - 无扩展名脚本和按文件魔数识别的原生可执行程序；
 - 可选 `/proc/<pid>/maps` 运行进程与密码库关联；
+- 可选导入 eBPF 事件，或显式启用固定、限时的 uprobe 观测；
 - 证据置信度、来源、语言、库、方法、算法和制品 SHA-256；
 - 单端点和批量端点输入；
 - CSV/JSON CMDB 资产导入；
@@ -68,7 +87,7 @@ X25519MLKEM768:X25519
 - SQLite 资产、证据、端点、CMDB 与风险数据归一化；
 - 定时持续扫描、快照保存和变化对比。
 
-### 1.3 运行时迁移监测
+### 1.4 运行时迁移监测
 
 HTTP 与 Stream 日志持久保存在：
 
@@ -92,7 +111,7 @@ runtime-data/metrics/pqc_gateway.prom
 - 按 HTTP、MQTT、TCP、遗留协议分类；
 - 按客户端地址汇总。
 
-### 1.4 完整安全实验
+### 1.5 完整安全实验
 
 一键实验覆盖：
 
@@ -109,7 +128,9 @@ runtime-data/metrics/pqc_gateway.prom
 - TCP echo；
 - 非 HTTP 遗留行协议；
 - 静态资产扫描、CMDB 导入、CIDR 发现和持续扫描；
-- 六种语言、ELF/JAR、无扩展名程序和进程映射的企业扫描矩阵；
+- 21 项六语言、编译数据库、宏/调用图、静态库、反修饰、ELF/JAR、eBPF 和进程映射扫描矩阵；
+- 10 项扫描到兼容/严格迁移 REST API 工作流矩阵；
+- 14 项 API-first 接入、发布、扫描、资产、迁移、状态、审计和回滚矩阵；
 - 风险评估、SQLite 导入和策略验证；
 - 持久化回退统计；
 - 握手、HTTP、TCP、遗留协议和 MQTT 性能测试。
@@ -236,7 +257,7 @@ docker build \
   --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
   --build-arg no_proxy=localhost,127.0.0.1,::1 \
   -f docker/Dockerfile.gateway \
-  -t pq-migration-gateway-pq-gateway:3.3 \
+  -t pq-migration-gateway-pq-gateway:3.6 \
   .
 ```
 
@@ -407,7 +428,7 @@ PERF_PROFILE=stress ./scripts/run_full_experiment.sh
 成功标志：
 
 ```text
-All v3.3 experiments completed: experiment-results/<UTC时间戳>
+All v3.6 experiments completed: experiment-results/<UTC时间戳>
 ```
 
 并生成：
@@ -558,7 +579,7 @@ make enterprise-inventory
 ELF/PE/JAR 制品、动态依赖、导入符号、SHA-256、证据置信度及进程映射。
 扫描器按文件魔数识别二进制，不执行目标程序，也不保存私钥内容。
 
-单独运行 15 项确定性实验：
+单独运行 21 项确定性实验：
 
 ```bash
 make enterprise-scan-test
@@ -862,6 +883,8 @@ make config-rollback VERSION=1
 export MANAGER_API_TOKEN='replace-with-a-random-secret'
 make control-plane
 curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/configs
+curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/scans
+curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/assets
 curl http://127.0.0.1:18080/metrics
 
 python3 manager/pqctl.py service list
@@ -869,13 +892,14 @@ python3 manager/pqctl.py agent list
 python3 manager/pqctl.py metrics prometheus
 ```
 
-完整说明见 `docs/service-model.md` 和 `docs/control-plane.md`。
+扫描任务使用 `/v1/scans`，资产、评估和迁移编排使用 `/v1/assets`。完整说明见
+`docs/service-model.md`、`docs/control-plane.md` 和 `docs/scan-migration-api.md`。
 
 ---
 
 ## 20. 项目边界
 
-v3.3 已提供单节点控制面运行时、安全发布闭环和非执行式企业密码资产发现，但仍是框架原型，不是生产网关成品。生产化仍需：
+v3.6 已提供单节点 API-first 企业部署、控制面运行时、安全发布闭环、持续仪表盘、企业密码资产发现及扫描到迁移编排，但仍是企业试点框架，不是完整集群产品。生产化仍需：
 
 - 银行或企业 PKI；
 - HSM/KMS；

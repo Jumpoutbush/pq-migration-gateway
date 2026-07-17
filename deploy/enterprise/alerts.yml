@@ -1,0 +1,25 @@
+groups:
+  - name: pq-gateway-enterprise
+    rules:
+      - alert: PQGatewayAgentUnhealthy
+        expr: gateway_agent_health == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "PQC Gateway agent is unhealthy"
+      - alert: PQGatewayHighClassicalFallback
+        expr: gateway_classical_fallback_ratio > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Classical TLS fallback remains above 5%"
+      - alert: PQGatewayHandshakeFailures
+        expr: increase(gateway_tls_handshake_failures_total[5m]) > 10
+        labels: {severity: warning}
+        annotations:
+          summary: "TLS handshake failures increased"
+      - alert: PQGatewayUpstreamTlsFailures
+        expr: increase(gateway_upstream_tls_failures_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Upstream TLS verification or handshake failed"

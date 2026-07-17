@@ -1,0 +1,18 @@
+{
+  "id": "payment-pqc-gateway",
+  "adapter": "http",
+  "listen": {
+    "address": "0.0.0.0",
+    "port": 28443,
+    "server_name": "payment-gateway.company.local"
+  },
+  "upstream": {
+    "address": "https://payment.internal:9443",
+    "tls": {
+      "enabled": true,
+      "verify": "required",
+      "sni": "payment.internal",
+      "ca": "/etc/ssl/certs/ca-certificates.crt"
+    }
+  }
+}

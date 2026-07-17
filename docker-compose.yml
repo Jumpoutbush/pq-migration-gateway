@@ -1,6 +1,6 @@
 services:
   bank-backend:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: bank-backend
     working_dir: /app
     entrypoint: ["python3"]
@@ -15,7 +15,7 @@ services:
       retries: 20
 
   secure-backend:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: secure-backend
     working_dir: /app
     entrypoint: ["python3"]
@@ -51,7 +51,7 @@ services:
       retries: 20
 
   tcp-backend:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: tcp-backend
     working_dir: /app
     entrypoint: ["python3"]
@@ -66,7 +66,7 @@ services:
       retries: 20
 
   legacy-backend:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: legacy-backend
     working_dir: /app
     entrypoint: ["python3"]
@@ -81,7 +81,7 @@ services:
       retries: 20
 
   mqtt-broker:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: mqtt-broker
     entrypoint: ["python3", "/app/mqtt_broker.py"]
     command: ["--host", "0.0.0.0", "--port", "1883"]
@@ -95,7 +95,7 @@ services:
       retries: 20
 
   pq-gateway:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
@@ -152,7 +152,7 @@ services:
       retries: 15
 
   metrics-agent:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: pq-metrics-agent
     depends_on:
       pq-gateway: {condition: service_healthy}
@@ -184,7 +184,7 @@ services:
     restart: unless-stopped
 
   scanner-scheduler:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: pq-scanner-scheduler
     profiles: ["continuous-scan"]
     depends_on:
@@ -199,7 +199,7 @@ services:
     restart: unless-stopped
 
   manager-api:
-    image: pq-migration-gateway-pq-gateway:3.3
+    image: pq-migration-gateway-pq-gateway:3.6
     container_name: pq-manager-api
     profiles: ["control-plane"]
     depends_on:
@@ -217,10 +217,14 @@ services:
     environment:
       MANAGER_API_TOKEN: "${MANAGER_API_TOKEN:-development-only-change-me}"
       PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:-}"
+      PQ_SCAN_ALLOWED_ROOTS: "/workspace/project"
+      PQ_PROCESS_SCAN_ENABLED: "${PQ_PROCESS_SCAN_ENABLED:-0}"
+      PQ_EBPF_ENABLED: "${PQ_EBPF_ENABLED:-0}"
     ports:
       - "127.0.0.1:18080:18080"
     volumes:
       - ./runtime-data/control:/var/lib/pq-control
+      - ./:/workspace/project:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/healthz"]
       interval: 10s

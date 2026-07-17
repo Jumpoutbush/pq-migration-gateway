@@ -1,12 +1,90 @@
 SHELL := /usr/bin/env bash
-IMAGE := pq-migration-gateway-pq-gateway:3.3
+IMAGE := pq-migration-gateway-pq-gateway:3.6
 WSL_PROXY ?= http://127.0.0.1:7897
 INIT_ARGS ?=
+ENTERPRISE_COMPOSE := deploy/enterprise/docker-compose.yml
+ENTERPRISE_ENV := .env.enterprise
+SCAN_ROOT ?= $(CURDIR)
+SERVER_NAME ?= pqc-gateway.local
+LISTEN_PORT ?= 8443
 
-.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test mtls-test upstream-test stream-test inventory enterprise-inventory enterprise-scan-test cmdb-import discover tls-scan continuous-scan metrics performance experiment clean zip
+.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test unit-test mtls-test upstream-test stream-test inventory enterprise-inventory enterprise-scan-test scan-migration-api-test api-first-test cmdb-import discover tls-scan continuous-scan metrics performance experiment enterprise-init enterprise-onboard enterprise-api-onboard enterprise-capabilities enterprise-validate enterprise-apply enterprise-history enterprise-rollback enterprise-up enterprise-down enterprise-status enterprise-logs enterprise-scan enterprise-assets enterprise-audit dashboard-up dashboard-down clean zip
 
 init:
 	./init_system.sh $(INIT_ARGS)
+
+enterprise-init:
+	./scripts/init_enterprise.sh --scan-root "$(SCAN_ROOT)" --server-name "$(SERVER_NAME)" --listen-port "$(LISTEN_PORT)"
+
+enterprise-onboard:
+	python3 manager/pqctl.py onboard
+
+enterprise-api-onboard:
+	@test -n "$(SERVICE_FILE)" || (echo "usage: make enterprise-api-onboard SERVICE_FILE=service.json" >&2; exit 2)
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py onboard --file "$(SERVICE_FILE)"
+
+enterprise-capabilities:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py capabilities
+
+enterprise-validate:
+	@test -s $(ENTERPRISE_ENV) || (echo "run 'make enterprise-init SCAN_ROOT=/path/to/apps' first" >&2; exit 2)
+	python3 scripts/render_gateway_config.py --config config/enterprise/services.json --output /tmp/pq-gateway-enterprise-nginx.conf --check
+
+enterprise-apply: enterprise-validate
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py release publish --file config/enterprise/services.json
+
+enterprise-history:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py release list
+
+enterprise-rollback:
+	@test -n "$(VERSION)" || (echo "usage: make enterprise-rollback VERSION=<version>" >&2; exit 2)
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py release rollback $(VERSION)
+
+enterprise-up: enterprise-validate
+	@docker image inspect $(IMAGE) >/dev/null 2>&1 || (echo "enterprise image is missing; run 'make build' first" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) up -d gateway manager-api metrics-agent
+	@for attempt in $$(seq 1 60);do curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break;sleep 1;done;curl -fsS http://127.0.0.1:18080/healthz >/dev/null
+	@if [[ ! -s runtime-data/enterprise/control/desired.json ]];then \
+	  set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py release publish --file config/enterprise/services.json; \
+	fi
+
+enterprise-down:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) --profile observability down
+
+enterprise-status:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) --profile observability ps
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py status
+
+enterprise-logs:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) logs -f gateway manager-api metrics-agent
+
+enterprise-scan:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py scan create --root /workspace/project
+
+enterprise-assets:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py asset list
+
+enterprise-audit:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py audit
+
+dashboard-up: enterprise-up
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) --profile observability up -d prometheus grafana
+	@echo "Grafana: http://127.0.0.1:3000 (user: admin; password: GRAFANA_ADMIN_PASSWORD in $(ENTERPRISE_ENV))"
+	@echo "Prometheus: http://127.0.0.1:9090"
+
+dashboard-down:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) --profile observability stop grafana prometheus
 
 certs:
 	./certs/gen-classic-demo-certs.sh ./certs
@@ -66,6 +144,9 @@ logs:
 test:
 	curl --noproxy '*' --resolve bank-gateway.local:8443:127.0.0.1 --cacert certs/ca.crt https://bank-gateway.local:8443/service-info
 
+unit-test:
+	python3 -m unittest discover -s tests -v
+
 mtls-test:
 	./scripts/test_mtls_matrix.sh experiment-results/manual-mtls
 
@@ -83,6 +164,12 @@ enterprise-inventory:
 
 enterprise-scan-test:
 	python3 scripts/test_enterprise_scanner.py experiment-results/manual-enterprise-scan
+
+scan-migration-api-test:
+	python3 scripts/test_scan_migration_api.py experiment-results/manual-scan-migration-api
+
+api-first-test:
+	python3 scripts/test_api_first_workflow.py experiment-results/manual-api-first
 
 cmdb-import:
 	PYTHONPATH=scanner python3 scanner/cmdb_import.py --input config/cmdb/sample-assets.csv --out-json cmdb-targets.json --out-csv cmdb-targets.csv
@@ -120,9 +207,10 @@ clean:
 	touch runtime-data/logs/.gitkeep runtime-data/metrics/.gitkeep runtime-data/scans/.gitkeep runtime-data/control/.gitkeep
 
 zip:
-	cd .. && zip -r pq-migration-gateway-v3.3.1.zip pq-migration-gateway-v3 \
+	cd .. && zip -r pq-migration-gateway-v3.6.0.zip pq-migration-gateway-v3 \
 	  -x '*/.git/*' '*/experiment-results/*' '*/runtime-data/logs/*.log' \
 	     '*/runtime-data/metrics/*' '*/runtime-data/scans/*' '*/runtime-data/control/*' \
 	     '*/certs/*.key' '*/certs/*.crt' '*/certs/*.csr' '*/certs/*.srl' \
 	     '*/certs/**/*.key' '*/certs/**/*.crt' '*/certs/**/*.csr' '*/certs/**/*.srl' \
-	     '*/outputs/*' '*/__pycache__/*' '*.pyc' '*/.env'
+	     '*/runtime-data/enterprise/*' '*/config/enterprise/services.json' \
+	     '*/outputs/*' '*/__pycache__/*' '*.pyc' '*/.env' '*/.env.enterprise'

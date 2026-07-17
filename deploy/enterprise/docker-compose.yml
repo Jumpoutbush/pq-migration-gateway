@@ -1,0 +1,149 @@
+name: pq-migration-gateway-enterprise
+
+services:
+  gateway:
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    container_name: pq-enterprise-gateway
+    network_mode: host
+    user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
+    environment:
+      SERVICES_CONFIG: /etc/pq-gateway/config/services.json
+      PQ_CONTROL_ENABLED: "true"
+      PQ_CONTROL_DIR: /var/lib/pq-control
+      PQ_CONTROL_DB: /var/lib/pq-control/control-plane.db
+      PQ_AGENT_ID: enterprise-gateway-1
+      PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:?set by make enterprise-init}"
+      PQ_AGENT_HEALTH_COMMAND: /opt/nginx/sbin/nginx -t -c /tmp/pq-gateway/nginx.conf
+    volumes:
+      - ../../config/enterprise:/etc/pq-gateway/config:ro
+      - ../../runtime-data/enterprise/certs:/etc/pq-gateway/certs:ro
+      - ../../runtime-data/enterprise/logs:/var/log/nginx
+      - ../../runtime-data/enterprise/control:/var/lib/pq-control
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,mode=0770,uid=${PQ_RUNTIME_UID:-1000},gid=${PQ_RUNTIME_GID:-1000}
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/opt/nginx/sbin/nginx", "-t", "-c", "/tmp/pq-gateway/nginx.conf"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  manager-api:
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    container_name: pq-enterprise-manager-api
+    network_mode: host
+    user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
+    depends_on:
+      gateway: {condition: service_healthy}
+    entrypoint: ["python3", "/opt/pq-gateway/manager/manager_api.py"]
+    command:
+      - --host
+      - "${PQ_MANAGER_API_BIND:-127.0.0.1}"
+      - --port
+      - "18080"
+      - --db
+      - /var/lib/pq-control/control-plane.db
+      - --control-dir
+      - /var/lib/pq-control
+    environment:
+      MANAGER_API_TOKEN: "${MANAGER_API_TOKEN:?set by make enterprise-init}"
+      PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:?set by make enterprise-init}"
+      PQ_SCAN_ALLOWED_ROOTS: /workspace/project
+      PQ_PROCESS_SCAN_ENABLED: "${PQ_PROCESS_SCAN_ENABLED:-0}"
+      PQ_EBPF_ENABLED: "${PQ_EBPF_ENABLED:-0}"
+    volumes:
+      - "${PQ_SCAN_HOST_ROOT:?set by make enterprise-init}:/workspace/project:ro"
+      - ../../runtime-data/enterprise/control:/var/lib/pq-control
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  metrics-agent:
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    container_name: pq-enterprise-metrics-agent
+    user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
+    depends_on:
+      gateway: {condition: service_healthy}
+    entrypoint: ["python3", "/opt/pq-gateway/manager/runtime_metrics.py"]
+    command:
+      - --log
+      - /var/log/nginx/access.log
+      - --log
+      - /var/log/nginx/stream-access.log
+      - --error-log
+      - /var/log/nginx/error.log
+      - --out
+      - /var/lib/pq-metrics/current.json
+      - --prometheus
+      - /var/lib/pq-metrics/pqc_gateway.prom
+      - --history
+      - /var/lib/pq-metrics/history.jsonl
+      - --db
+      - /var/lib/pq-control/control-plane.db
+      - --interval
+      - "30"
+    volumes:
+      - ../../runtime-data/enterprise/logs:/var/log/nginx:ro
+      - ../../runtime-data/enterprise/metrics:/var/lib/pq-metrics
+      - ../../runtime-data/enterprise/control:/var/lib/pq-control
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: pq-enterprise-prometheus
+    profiles: ["observability"]
+    network_mode: host
+    user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
+    depends_on:
+      manager-api: {condition: service_healthy}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ../../runtime-data/enterprise/prometheus:/prometheus
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: pq-enterprise-grafana
+    profiles: ["observability"]
+    network_mode: host
+    user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set by make enterprise-init}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_PATHS_LOGS: /var/lib/grafana/log
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ../../runtime-data/enterprise/grafana:/var/lib/grafana
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

@@ -38,7 +38,7 @@ class GatewayAgent:
         self.health_command = health_command
         self.signing_key = signing_key
         self.agent_id = agent_id or os.environ.get("PQ_AGENT_ID", "") or socket.gethostname()
-        self.metadata = {"hostname": socket.gethostname(), "framework_version": "3.3.1", **(metadata or {})}
+        self.metadata = {"hostname": socket.gethostname(), "framework_version": "3.6.0", **(metadata or {})}
         self.status_url = status_url
 
     def _command(self, args: list[str]) -> None:

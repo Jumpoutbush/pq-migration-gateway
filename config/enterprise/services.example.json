@@ -1,0 +1,49 @@
+{
+  "schema_version": "4.0",
+  "defaults": {
+    "certificate": "/etc/pq-gateway/certs/server.crt",
+    "certificate_key": "/etc/pq-gateway/certs/server.key",
+    "client_ca": "/etc/pq-gateway/certs/ca.crt",
+    "upstream_ca": "/etc/ssl/certs/ca-certificates.crt",
+    "dns_resolver": "127.0.0.1",
+    "connect_timeout": "5s",
+    "send_timeout": "60s",
+    "read_timeout": "60s"
+  },
+  "services": [
+    {
+      "id": "enterprise-pilot",
+      "adapter": "http",
+      "listen": {
+        "address": "0.0.0.0",
+        "port": 8443,
+        "server_name": "pqc-gateway.local"
+      },
+      "downstream_tls": {
+        "mode": "compatibility",
+        "groups": ["X25519MLKEM768", "X25519"],
+        "client_auth": "off",
+        "certificate": "/etc/pq-gateway/certs/server.crt",
+        "private_key": {"provider": "file", "reference": "/etc/pq-gateway/certs/server.key"},
+        "client_ca": "/etc/pq-gateway/certs/ca.crt"
+      },
+      "upstream": {
+        "address": "http://127.0.0.1:8080",
+        "tls": {
+          "enabled": false,
+          "verify": "off",
+          "sni": "",
+          "ca": "/etc/ssl/certs/ca-certificates.crt",
+          "client_identity": {
+            "certificate": "",
+            "private_key": {"provider": "file", "reference": ""}
+          }
+        }
+      },
+      "timeouts": {"connect": "5s", "send": "60s", "read": "60s"},
+      "rollout": {"policy": "fixed", "hybrid_percentage": 100, "fallback_allowed": true},
+      "audit": {"enabled": true},
+      "protocol_options": {}
+    }
+  ]
+}

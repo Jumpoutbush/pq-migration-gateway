@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# PQC Migration Gateway v3.3 complete experiment.
+# PQC Migration Gateway v3.6 complete experiment.
 # Default build path uses the WSL proxy at 127.0.0.1:7897.
 # Usage:
 #   ./scripts/run_full_experiment.sh
@@ -51,7 +51,7 @@ done
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="${RESULT_ROOT}/${TIMESTAMP}"
-IMAGE="pq-migration-gateway-pq-gateway:3.3"
+IMAGE="pq-migration-gateway-pq-gateway:3.6"
 PROXY_URL="${WSL_PROXY:-http://127.0.0.1:7897}"
 OPENSSL_BIN="/opt/openssl/bin/openssl"
 CA_CONTAINER="/etc/pq-gateway/certs/ca.crt"
@@ -153,8 +153,8 @@ def load(path,default=None):
     p=r/path
     if not p.exists():return default or {}
     return json.loads(p.read_text())
-static=load('crypto-inventory.json').get('summary',{});tls=load('tls-inventory.json').get('summary',{});risk=load('risk-report.json').get('summary',{});verify=load('migration-verification.json').get('summary',{});db=load('inventory-db-summary.json');mtls=load('mtls/mtls-matrix.json').get('summary',{});up=load('upstream/upstream-tls-matrix.json').get('summary',{});stream=load('stream/stream-protocol-matrix.json').get('summary',{});runtime=load('runtime-fallback-report.json').get('summary',{});experiment=load('experiment-fallback-report.json').get('summary',{});perf=load('performance/performance-report.json').get('summary',{});disc=load('network-discovery.json').get('summary',{});cmdb=load('cmdb-targets.json').get('summary',{});enterprise=load('enterprise-scan/enterprise-crypto-inventory.json').get('summary',{});enterprise_matrix=load('enterprise-scan/enterprise-scanner-matrix.json').get('summary',{})
-text=f'''# PQC Migration Gateway v3.3 Experiment Summary
+static=load('crypto-inventory.json').get('summary',{});tls=load('tls-inventory.json').get('summary',{});risk=load('risk-report.json').get('summary',{});verify=load('migration-verification.json').get('summary',{});db=load('inventory-db-summary.json');mtls=load('mtls/mtls-matrix.json').get('summary',{});up=load('upstream/upstream-tls-matrix.json').get('summary',{});stream=load('stream/stream-protocol-matrix.json').get('summary',{});runtime=load('runtime-fallback-report.json').get('summary',{});experiment=load('experiment-fallback-report.json').get('summary',{});perf=load('performance/performance-report.json').get('summary',{});disc=load('network-discovery.json').get('summary',{});cmdb=load('cmdb-targets.json').get('summary',{});enterprise=load('enterprise-scan/enterprise-crypto-inventory.json').get('summary',{});enterprise_matrix=load('enterprise-scan/enterprise-scanner-matrix.json').get('summary',{});api_matrix=load('scan-migration-api/scan-migration-api-matrix.json').get('summary',{});api_first=load('api-first/api-first-matrix.json').get('summary',{})
+text=f'''# PQC Migration Gateway v3.6 Experiment Summary
 
 ## Overall result
 
@@ -170,6 +170,8 @@ text=f'''# PQC Migration Gateway v3.3 Experiment Summary
 ## Enterprise discovery and inventory
 
 - Enterprise source/binary/runtime matrix: {enterprise_matrix.get('passed',0)}/{enterprise_matrix.get('tests',0)} passed
+- Scan-to-migration REST API matrix: {api_matrix.get('passed',0)}/{api_matrix.get('tests',0)} passed
+- API-first onboarding/release/rollback matrix: {api_first.get('passed',0)}/{api_first.get('tests',0)} passed
 - Languages covered: C/C++, Java, Rust, Go, Python and Shell
 - Crypto-relevant artifacts: {enterprise.get('crypto_relevant_artifacts',0)}
 - Native executables / Java archives / runtime processes: {enterprise.get('native_executables',0)}/{enterprise.get('java_archives',0)}/{enterprise.get('runtime_crypto_processes',0)}
@@ -200,6 +202,8 @@ The persistent metrics include traffic accumulated in `runtime-data/logs`, not o
 - `stream/stream-protocol-matrix.json`
 - `crypto-inventory.json` and `tls-inventory.json`
 - `enterprise-scan/enterprise-scanner-matrix.json`, inventory JSON and CSV
+- `scan-migration-api/scan-migration-api-matrix.json`
+- `api-first/api-first-matrix.json`
 - `network-discovery.json` and `cmdb-targets.json`
 - `continuous-scan-latest.json` and `continuous-scan-diff.json`
 - `risk-report.json` and `inventory.db`
@@ -250,6 +254,10 @@ main(){
   python3 scripts/crypto_inventory.py --root ./certs --root ./gateway --root ./backend --root ./config --root ./docker-compose.yml --root ./scripts --root ./scanner --root ./manager --out-json "$RESULT_DIR/crypto-inventory.json" --out-csv "$RESULT_DIR/crypto-inventory.csv"
   log 'Running enterprise source, executable, JAR and process-map scanner matrix'
   python3 scripts/test_enterprise_scanner.py "$RESULT_DIR/enterprise-scan"
+  log 'Running scan-to-asset-to-migration REST API workflow matrix'
+  python3 scripts/test_scan_migration_api.py "$RESULT_DIR/scan-migration-api"
+  log 'Running API-first onboarding, service publication, status and rollback workflow matrix'
+  python3 scripts/test_api_first_workflow.py "$RESULT_DIR/api-first"
   log 'Importing sample CMDB assets into normalized targets'
   PYTHONPATH=scanner python3 scanner/cmdb_import.py --input config/cmdb/sample-assets.csv --out-json "$RESULT_DIR/cmdb-targets.json" --out-csv "$RESULT_DIR/cmdb-targets.csv"
   log 'Running explicit CIDR discovery against locally exposed test ports'
@@ -273,20 +281,14 @@ main(){
   extract_log_delta runtime-data/logs/stream-access.log "$STREAM_START" "$RESULT_DIR/experiment-stream-access.log"
   python3 manager/fallback_report.py --log "$RESULT_DIR/experiment-http-access.log" --log "$RESULT_DIR/experiment-stream-access.log" --out "$RESULT_DIR/experiment-fallback-report.json"
   python3 manager/fallback_report.py --log runtime-data/logs/access.log --log runtime-data/logs/stream-access.log --out "$RESULT_DIR/runtime-fallback-report.json"
-  docker compose exec -T metrics-agent python3 /workspace/manager/runtime_metrics.py \
-    --log /var/log/nginx/access.log \
-    --log /var/log/nginx/stream-access.log \
-    --error-log /var/log/nginx/error.log \
-    --out /var/lib/pq-metrics/current.json \
-    --prometheus /var/lib/pq-metrics/pqc_gateway.prom \
-    --once
+  python3 manager/runtime_metrics.py --log runtime-data/logs/access.log --log runtime-data/logs/stream-access.log --out runtime-data/metrics/current.json --prometheus runtime-data/metrics/pqc_gateway.prom --once
   cp runtime-data/metrics/current.json "$RESULT_DIR/runtime-metrics-current.json";cp runtime-data/metrics/pqc_gateway.prom "$RESULT_DIR/pqc_gateway.prom"
 
   log "Running complete performance suite profile=$PERF_PROFILE"
   PERF_PROFILE="$PERF_PROFILE" ./scripts/run_performance_suite.sh "$RESULT_DIR/performance"
   write_summary
-  write_status PASS 'All v3.3 experiments completed successfully' 0
+  write_status PASS 'All v3.6 experiments completed successfully' 0
   publish_latest || die "Could not update latest experiment pointer"
-  log "All v3.3 experiments completed: $RESULT_DIR"
+  log "All v3.6 experiments completed: $RESULT_DIR"
 }
 main "$@"

@@ -31,9 +31,11 @@ from scanner.enterprise_inventory import (  # noqa: E402
     SOURCE_LANGUAGES,
     artifact_dict,
     inspect_file,
+    load_compile_commands,
     process_dict,
     scan_processes,
 )
+from scanner.ebpf_observer import evidence as ebpf_evidence, observe as observe_ebpf, parse_trace as parse_ebpf_trace  # noqa: E402
 
 CERT_EXTS = {".crt", ".cer", ".pem"}
 KEY_EXTS = {".key", ".pem"}
@@ -273,6 +275,23 @@ def iter_files(roots: list[Path], excludes: set[str], max_files: int):
                     return
 
 
+def discover_compile_databases(roots: list[Path], excludes: set[str], limit: int = 100) -> list[Path]:
+    databases: list[Path] = []
+    for root in roots:
+        if root.is_file() and root.name == "compile_commands.json":
+            databases.append(root)
+            continue
+        if not root.is_dir():
+            continue
+        for directory, names, files in os.walk(root, topdown=True, followlinks=False, onerror=lambda _error: None):
+            names[:] = [name for name in names if name not in excludes and not (Path(directory) / name).is_symlink()]
+            if "compile_commands.json" in files:
+                databases.append(Path(directory) / "compile_commands.json")
+                if len(databases) >= limit:
+                    return databases
+    return databases
+
+
 def evidence_from_signal(path: Path, signal: dict, artifact_id: str = "") -> Evidence:
     algorithm = signal.get("algorithm", "unknown")
     excerpt = signal.get("excerpt", "")[:500]
@@ -307,6 +326,14 @@ def main() -> int:
     parser.add_argument("--proc-root", default="/proc", help="Alternate proc filesystem root for process inspection/tests")
     parser.add_argument("--max-processes", type=positive_int, default=20_000)
     parser.add_argument("--include-command-lines", action="store_true", help="Collect redacted process command lines; disabled by default")
+    parser.add_argument("--compile-commands", action="append", default=[], help="Explicit compile_commands.json; may be repeated")
+    parser.add_argument("--no-auto-compile-commands", action="store_true", help="Do not discover compile_commands.json below roots")
+    parser.add_argument("--ebpf-trace-file", action="append", default=[], help="Import an authorized JSONL/TSV eBPF trace")
+    parser.add_argument("--enable-ebpf", action="store_true", help="Run the fixed bpftrace uprobe collector (requires host privileges)")
+    parser.add_argument("--ebpf-pid", type=int, default=0)
+    parser.add_argument("--ebpf-library", default="")
+    parser.add_argument("--ebpf-duration", type=positive_int, default=5)
+    parser.add_argument("--bpftrace", default="bpftrace")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--out-csv", required=True)
     args = parser.parse_args()
@@ -317,6 +344,11 @@ def main() -> int:
     artifacts: dict[str, dict] = {}
     scan_stats = {"files_seen": 0, "source_files_inspected": 0, "binary_files_inspected": 0, "files_skipped": 0}
     excludes = set(DEFAULT_EXCLUDES) | set(args.exclude)
+    compile_paths = [Path(item) for item in args.compile_commands]
+    if not args.no_auto_compile_commands:
+        compile_paths.extend(discover_compile_databases(roots, excludes))
+    compile_paths = list(dict.fromkeys(path.resolve() for path in compile_paths if path.is_file()))
+    compile_contexts, compile_stats = load_compile_commands(compile_paths)
     scanner_implementation_files = {
         Path(__file__).resolve(),
         (PROJECT_ROOT / "scanner/enterprise_inventory.py").resolve(),
@@ -336,7 +368,10 @@ def main() -> int:
             key = identify_private_key(path, args.openssl)
             if key:
                 assets[key.asset_id] = key
-        artifact, signals, inspected = inspect_file(path, args.max_text_bytes, args.max_binary_bytes, args.max_evidence_per_file)
+        artifact, signals, inspected = inspect_file(
+            path, args.max_text_bytes, args.max_binary_bytes, args.max_evidence_per_file,
+            cpp_compile_context=compile_contexts.get(str(path.resolve())),
+        )
         if inspected.get("kind") == "source":
             scan_stats["source_files_inspected"] += 1
         elif inspected.get("kind") == "binary":
@@ -362,6 +397,26 @@ def main() -> int:
             item = evidence_from_signal(Path(signal["path"]), signal)
             evidence[item.evidence_id] = item
 
+    ebpf_events: list[dict] = []
+    ebpf_collectors: list[dict] = []
+    for trace_name in args.ebpf_trace_file:
+        trace_path = Path(trace_name)
+        events = parse_ebpf_trace(trace_path)
+        ebpf_events.extend(events)
+        ebpf_collectors.append({"mode": "import", "path": str(trace_path.resolve()), "events": len(events)})
+        for signal in ebpf_evidence(events, str(trace_path.resolve())):
+            item = evidence_from_signal(trace_path, signal)
+            evidence[item.evidence_id] = item
+    if args.enable_ebpf:
+        if not args.ebpf_pid or not args.ebpf_library:
+            parser.error("--enable-ebpf requires --ebpf-pid and --ebpf-library")
+        events, metadata = observe_ebpf(args.ebpf_pid, Path(args.ebpf_library), args.ebpf_duration, args.bpftrace)
+        ebpf_events.extend(events)
+        ebpf_collectors.append({"mode": "live", **metadata})
+        for signal in ebpf_evidence(events, args.ebpf_library):
+            item = evidence_from_signal(Path(args.ebpf_library), signal)
+            evidence[item.evidence_id] = item
+
     asset_rows = [asdict(x) for x in sorted(assets.values(), key=lambda x: (x.asset_type, x.path))]
     evidence_rows = [asdict(x) for x in sorted(evidence.values(), key=lambda x: (x.path, x.line, x.algorithm))]
     artifact_rows = sorted(artifacts.values(), key=lambda x: (x["artifact_type"], x["path"]))
@@ -369,8 +424,8 @@ def main() -> int:
     languages = [item["language"] for item in evidence_rows if item.get("language") and item["language"] != "config"]
     confidence = [item.get("confidence", "MEDIUM") for item in evidence_rows]
     payload = {
-        "schema_version": 3,
-        "scanner_version": "3.3.1",
+        "schema_version": 4,
+        "scanner_version": "3.6.0",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "roots": [str(p.resolve()) for p in roots],
         "summary": {
@@ -383,6 +438,8 @@ def main() -> int:
             "java_archives": sum(x["artifact_type"] == "java_archive" for x in artifact_rows),
             "java_classes": sum(x["artifact_type"] == "java_class" for x in artifact_rows),
             "runtime_crypto_processes": len(runtime_rows),
+            "runtime_crypto_api_observations": len(ebpf_events),
+            "compile_database_entries": compile_stats["entries"],
             "files_seen": scan_stats["files_seen"],
             "source_files_inspected": scan_stats["source_files_inspected"],
             "binary_files_inspected": scan_stats["binary_files_inspected"],
@@ -396,7 +453,12 @@ def main() -> int:
         "evidence": evidence_rows,
         "artifacts": artifact_rows,
         "runtime_processes": runtime_rows,
-        "scan_statistics": {"filesystem": scan_stats, "processes": process_stats, "excluded_directory_names": sorted(excludes)},
+        "scan_statistics": {
+            "filesystem": scan_stats, "processes": process_stats,
+            "compile_commands": {**compile_stats, "paths": [str(path) for path in compile_paths]},
+            "ebpf": {"collectors": ebpf_collectors, "events": len(ebpf_events), "live_collection_enabled": args.enable_ebpf},
+            "excluded_directory_names": sorted(excludes),
+        },
         # Compatibility field for tools that consumed v1 findings.
         "findings": asset_rows + evidence_rows,
     }
@@ -414,7 +476,7 @@ def main() -> int:
         for item in evidence_rows:
             writer.writerow({"record_kind": "evidence", "id": item["evidence_id"], "path": item["path"], "type": item["evidence_type"], "algorithm": item["algorithm"], "key_bits": "", "line": item["line"], "deployment_status": item["deployment_status"], "risk": item["risk"], "pq_status": item["pq_status"], "recommendation": item["recommendation"], "excerpt": item["excerpt"], "language": item["language"], "method": item["method"], "library": item["library"], "confidence": item["confidence"], "artifact_type": item["artifact_type"], "source": item["source"], "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
         for item in artifact_rows:
-            writer.writerow({"record_kind": "artifact", "id": item["artifact_id"], "path": item["path"], "type": item["file_format"], "algorithm": "", "key_bits": "", "line": "", "deployment_status": "present", "risk": "", "pq_status": "", "recommendation": "", "excerpt": ";".join(item.get("dependencies", [])), "language": ";".join(item.get("languages", [])), "method": ";".join(item.get("imported_symbols", [])), "library": "", "confidence": item["confidence"], "artifact_type": item["artifact_type"], "source": "artifact_inspection", "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
+            writer.writerow({"record_kind": "artifact", "id": item["artifact_id"], "path": item["path"], "type": item["file_format"], "algorithm": "", "key_bits": "", "line": "", "deployment_status": "present", "risk": "", "pq_status": "", "recommendation": "", "excerpt": ";".join(item.get("dependencies", [])), "language": ";".join(item.get("languages", [])), "method": ";".join(item.get("imported_symbols", []) + item.get("demangled_symbols", [])), "library": "", "confidence": item["confidence"], "artifact_type": item["artifact_type"], "source": "artifact_inspection", "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
         for item in runtime_rows:
             writer.writerow({"record_kind": "runtime_process", "id": item["process_id"], "path": item["executable"], "type": "process", "algorithm": "runtime-selected", "key_bits": "", "line": "", "deployment_status": "runtime_observed", "risk": "INFO", "pq_status": "unknown", "recommendation": "Correlate the mapped library with application ownership and runtime TLS observations.", "excerpt": item["command"], "language": "runtime", "method": ";".join(item["mapped_crypto_libraries"]), "library": ";".join(item["mapped_crypto_libraries"]), "confidence": item["confidence"], "artifact_type": "runtime_process", "source": "proc_maps", "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False)})
     print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))

@@ -1,6 +1,6 @@
 # Architecture
 
-PQC Migration Gateway v3.3 separates enterprise crypto discovery, persistent control-plane state and traffic execution.
+PQC Migration Gateway v3.6 separates enterprise crypto discovery, API-first persistent control-plane state and traffic execution, while connecting scan assets to guarded migration releases and a dedicated enterprise operations profile.
 
 ```text
 Source / binaries / JAR / processes / CMDB / endpoints / CIDR

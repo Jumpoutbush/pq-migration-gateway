@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticated v3.3 REST API for Gateway control-plane resources."""
+"""Authenticated v3.6 API-first Gateway control plane."""
 from __future__ import annotations
 
 import argparse
@@ -16,11 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gateway.adapters import default_registry  # noqa: E402
+from manager.api_workflows import publish_service  # noqa: E402
 from manager.config_store import ConfigStore, ReleaseTransitionError  # noqa: E402
 from manager.control_plane import stage_document, stage_resources, stage_rollback, validate_document  # noqa: E402
+from manager.openapi import document as openapi_document  # noqa: E402
+from manager.scan_orchestrator import ScanOrchestrator  # noqa: E402
 from manager.state_machine import MigrationStateMachine, TransitionError  # noqa: E402
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+SAFE_HOST = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,255}$")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -29,6 +34,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     token: str
     metrics_public = True
     max_body = 2 * 1024 * 1024
+    scanner: ScanOrchestrator
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("manager-api: " + fmt % args + "\n")
@@ -54,7 +60,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return parsed.path.rstrip("/") or "/", parse_qs(parsed.query)
 
     def authenticated(self, path: str) -> bool:
-        if path == "/healthz" or (path == "/metrics" and self.metrics_public):
+        if path in {"/healthz", "/openapi.json"} or (path == "/metrics" and self.metrics_public):
             return True
         supplied = self.headers.get("Authorization", "")
         expected = "Bearer " + self.token
@@ -95,29 +101,78 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.reply(401, {"error": "authentication required"})
             return
 
-        if self.command == "GET" and path == "/healthz":
+        if self.command == "GET" and path == "/openapi.json":
+            host = self.headers.get("Host", "127.0.0.1:18080")
+            if not SAFE_HOST.fullmatch(host):
+                host = "127.0.0.1:18080"
+            self.reply(200, openapi_document(f"http://{host}"))
+        elif self.command == "GET" and path == "/healthz":
             latest = self.store.latest_version()
-            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.3.1", "latest_config": latest["version"] if latest else None})
+            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.6.0", "latest_release": latest["version"] if latest else None})
         elif self.command == "GET" and path == "/metrics":
             self.reply_text(200, self.store.prometheus_text(), "text/plain; version=0.0.4; charset=utf-8")
         elif self.command == "GET" and path == "/v1/metrics":
             self.reply(200, {"items": self.store.list_metrics()})
-        elif self.command == "GET" and path == "/v1/configs":
+        elif self.command == "GET" and path == "/v1/capabilities":
+            registry = default_registry()
+            self.reply(200, {
+                "api_version": "3.6.0",
+                "adapters": [{"name": name, "plane": registry.get(name).plane} for name in registry.names()],
+                "authorized_scan_roots": [str(item) for item in self.scanner.allowed_roots],
+                "release_lifecycle": [
+                    "DRAFT", "VALIDATED", "STAGED", "APPLIED", "HEALTHY",
+                    "VALIDATION_FAILED", "NGINX_TEST_FAILED", "RELOAD_FAILED",
+                    "HEALTH_CHECK_FAILED", "ROLLED_BACK",
+                ],
+                "migration_lifecycle": [
+                    "DISCOVERED", "ASSESSED", "PLANNED", "COMPATIBILITY",
+                    "PQC_PREFERRED", "STRICT", "VERIFIED", "DEGRADED",
+                    "ROLLED_BACK", "BLOCKED",
+                ],
+                "workflows": {
+                    "onboard_and_publish": "POST /v1/onboarding",
+                    "scan": "POST /v1/scans",
+                    "asset_migration": "POST /v1/assets/{asset_id}/migration",
+                    "rollback": "POST /v1/releases/{version}/rollback",
+                },
+            })
+        elif self.command == "GET" and path == "/v1/status":
+            stale_after = float(query.get("stale_after", ["30"])[0])
+            self.reply(200, self.store.system_summary(stale_after))
+        elif self.command == "POST" and path == "/v1/onboarding":
+            self.reply(202, publish_service(self.store, self.control_dir, self.body(), self.actor()))
+        elif self.command == "GET" and path in {"/v1/configs", "/v1/releases"}:
             self.reply(200, {"items": self.store.list_versions(self.limit(query, 50))})
-        elif self.command == "GET" and (match := re.fullmatch(r"/v1/configs/(\d+)", path)):
+        elif self.command == "POST" and path == "/v1/scans":
+            self.reply(202, self.scanner.submit(self.body(), self.actor()))
+        elif self.command == "GET" and path == "/v1/scans":
+            self.reply(200, {"items": self.store.list_scan_jobs(self.limit(query))})
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/scans/([A-Za-z0-9._-]+)", path)):
+            self.reply(200, self.store.get_scan_job(match.group(1)))
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/scans/([A-Za-z0-9._-]+)/findings", path)):
+            self.reply(200, {"items": self.store.list_scan_findings(match.group(1), self.limit(query, 1000))})
+        elif self.command == "GET" and path == "/v1/assets":
+            self.reply(200, {"items": self.store.list_crypto_assets(self.limit(query, 500))})
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/assets/([A-Za-z0-9._-]+)", path)):
+            self.reply(200, self.store.get_crypto_asset(match.group(1), self.limit(query, 1000)))
+        elif self.command == "POST" and (match := re.fullmatch(r"/v1/assets/([A-Za-z0-9._-]+)/assess", path)):
+            self.reply(201, self.scanner.assess(match.group(1), self.actor()))
+        elif self.command == "POST" and (match := re.fullmatch(r"/v1/assets/([A-Za-z0-9._-]+)/migration", path)):
+            self.reply(202, self.scanner.migrate(match.group(1), self.body(), self.actor()))
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/(?:configs|releases)/(\d+)", path)):
             self.reply(200, self.store.get_version(int(match.group(1)), include_rendered=False))
-        elif self.command == "POST" and path == "/v1/configs/validate":
+        elif self.command == "POST" and path in {"/v1/configs/validate", "/v1/releases/validate"}:
             result = validate_document(self.body())
             self.reply(200, {"valid": True, "checksum": result["checksum"], "services": len(result["canonical"]["services"]), "policies": result["policies"]})
-        elif self.command == "POST" and path == "/v1/configs":
+        elif self.command == "POST" and path in {"/v1/configs", "/v1/releases"}:
             self.reply(202, stage_document(self.store, self.control_dir, self.body(), self.actor()))
-        elif self.command == "POST" and path == "/v1/configs/from-resources":
+        elif self.command == "POST" and path in {"/v1/configs/from-resources", "/v1/releases/from-resources"}:
             body = self.body()
             defaults = body.get("defaults")
             if defaults is not None and not isinstance(defaults, dict):
                 raise ValueError("defaults must be an object")
             self.reply(202, stage_resources(self.store, self.control_dir, self.actor(), defaults))
-        elif self.command == "POST" and (match := re.fullmatch(r"/v1/configs/(\d+)/rollback", path)):
+        elif self.command == "POST" and (match := re.fullmatch(r"/v1/(?:configs|releases)/(\d+)/rollback", path)):
             self.reply(202, stage_rollback(self.store, self.control_dir, int(match.group(1)), self.actor()))
         elif self.command == "GET" and path in {"/v1/services", "/v1/policies"}:
             kind = "service" if path.endswith("services") else "policy"
@@ -126,6 +181,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             kind = "service" if path.endswith("services") else "policy"
             resource_id, spec = self.resource_spec(self.body())
             self.reply(201, self.store.upsert_resource(kind, resource_id, spec, self.actor()))
+        elif self.command == "POST" and (match := re.fullmatch(r"/v1/services/([A-Za-z0-9._-]+)/publish", path)):
+            self.reply(202, publish_service(self.store, self.control_dir, self.body(), self.actor(), match.group(1)))
         elif match := re.fullmatch(r"/v1/(services|policies)/([A-Za-z0-9._-]+)", path):
             kind = "service" if match.group(1) == "services" else "policy"
             resource_id = match.group(2)
@@ -209,6 +266,10 @@ def main() -> int:
     parser.add_argument("--control-dir", default="runtime-data/control")
     parser.add_argument("--token", default=os.environ.get("MANAGER_API_TOKEN", ""))
     parser.add_argument("--private-metrics", action="store_true", help="Require the bearer token for /metrics")
+    parser.add_argument("--scan-root", action="append", default=[], help="Authorized scan root; may be repeated")
+    parser.add_argument("--scan-workers", type=int, default=2)
+    parser.add_argument("--enable-process-scan", action="store_true")
+    parser.add_argument("--enable-ebpf", action="store_true")
     args = parser.parse_args()
     if not args.token:
         print("manager-api refuses to start without MANAGER_API_TOKEN or --token", file=sys.stderr)
@@ -217,14 +278,22 @@ def main() -> int:
     ApiHandler.control_dir = Path(args.control_dir)
     ApiHandler.token = args.token
     ApiHandler.metrics_public = not args.private_metrics
+    environment_roots = [item for item in os.environ.get("PQ_SCAN_ALLOWED_ROOTS", "").split(os.pathsep) if item]
+    allowed_roots = args.scan_root + environment_roots or [str(ROOT)]
+    ApiHandler.scanner = ScanOrchestrator(
+        ApiHandler.store, args.control_dir, allowed_roots, workers=args.scan_workers,
+        process_scan_enabled=args.enable_process_scan or os.environ.get("PQ_PROCESS_SCAN_ENABLED") == "1",
+        ebpf_enabled=args.enable_ebpf or os.environ.get("PQ_EBPF_ENABLED") == "1",
+    )
     server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
-    print(f"manager-api v3.3 listening on {args.host}:{args.port}", file=sys.stderr)
+    print(f"manager-api v3.6 listening on {args.host}:{args.port}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        ApiHandler.scanner.close()
     return 0
 
 

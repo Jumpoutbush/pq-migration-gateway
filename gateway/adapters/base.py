@@ -49,6 +49,9 @@ def upstream_tls_lines(service: dict, stream: bool = False) -> list[str]:
         if not tls["enabled"]:
             return lines
     if tls["enabled"]:
+        # Do not let a successful upstream mTLS connection authenticate a
+        # different service that points at the same address/SNI. Each service
+        # must perform its own handshake with its configured CA and identity.
         lines.append("        proxy_ssl_session_reuse off;")
     lines.append("        proxy_ssl_protocols TLSv1.2 TLSv1.3;")
     lines.append(f"        proxy_ssl_server_name {'on' if tls['sni'] else 'off'};")
@@ -64,4 +67,3 @@ def upstream_tls_lines(service: dict, stream: bool = False) -> list[str]:
             f"        proxy_ssl_certificate_key {identity['private_key']['reference']};",
         ])
     return lines
-

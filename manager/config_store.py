@@ -143,6 +143,71 @@ CREATE TABLE IF NOT EXISTS runtime_metrics(
   updated_at TEXT NOT NULL,
   PRIMARY KEY(metric_name,labels_json)
 );
+CREATE TABLE IF NOT EXISTS scan_jobs(
+  scan_id TEXT PRIMARY KEY,
+  scan_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  output_path TEXT NOT NULL,
+  error TEXT,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_created ON scan_jobs(created_at);
+CREATE TABLE IF NOT EXISTS crypto_assets(
+  asset_id TEXT PRIMARY KEY,
+  latest_scan_id TEXT NOT NULL,
+  asset_type TEXT NOT NULL,
+  path TEXT NOT NULL,
+  algorithm TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  pq_status TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(latest_scan_id) REFERENCES scan_jobs(scan_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crypto_assets_risk ON crypto_assets(risk);
+CREATE INDEX IF NOT EXISTS idx_crypto_assets_path ON crypto_assets(path);
+CREATE TABLE IF NOT EXISTS scan_findings(
+  scan_id TEXT NOT NULL,
+  finding_id TEXT NOT NULL,
+  asset_id TEXT,
+  finding_type TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY(scan_id,finding_id),
+  FOREIGN KEY(scan_id) REFERENCES scan_jobs(scan_id),
+  FOREIGN KEY(asset_id) REFERENCES crypto_assets(asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_findings_asset ON scan_findings(asset_id);
+CREATE TABLE IF NOT EXISTS asset_assessments(
+  assessment_id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(asset_id) REFERENCES crypto_assets(asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_assessments_asset ON asset_assessments(asset_id,created_at);
+CREATE TABLE IF NOT EXISTS migration_plans(
+  plan_id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  service_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  compatibility_version INTEGER,
+  strict_version INTEGER,
+  plan_json TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(asset_id) REFERENCES crypto_assets(asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_migration_plans_asset ON migration_plans(asset_id,updated_at);
 """
 
 
@@ -319,6 +384,230 @@ class ConfigStore:
             row = conn.execute("SELECT value_json FROM control_settings WHERE setting_key=?", (key,)).fetchone()
         return json.loads(row["value_json"]) if row else default
 
+    def create_scan_job(self, scan_id: str, scan_type: str, request: dict, actor: str) -> dict:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO scan_jobs(scan_id,scan_type,status,request_json,summary_json,output_path,error,actor,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (scan_id, scan_type, "QUEUED", json.dumps(request, ensure_ascii=False, sort_keys=True), "{}", "", None, actor, now),
+            )
+            self._audit_conn(conn, now, actor, "scan.create", "scan_job", scan_id, {"scan_type": scan_type})
+        return self.get_scan_job(scan_id)
+
+    def update_scan_job(self, scan_id: str, status: str, *, summary: dict | None = None,
+                        output_path: str = "", error: str | None = None) -> dict:
+        allowed = {"QUEUED", "RUNNING", "SUCCEEDED", "FAILED"}
+        if status not in allowed:
+            raise ValueError(f"unknown scan status: {status}")
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute("SELECT status FROM scan_jobs WHERE scan_id=?", (scan_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown scan: {scan_id}")
+            started = now if status == "RUNNING" else None
+            completed = now if status in {"SUCCEEDED", "FAILED"} else None
+            conn.execute(
+                "UPDATE scan_jobs SET status=?,summary_json=COALESCE(?,summary_json),"
+                "output_path=CASE WHEN ?='' THEN output_path ELSE ? END,error=?,"
+                "started_at=COALESCE(started_at,?),completed_at=COALESCE(?,completed_at) WHERE scan_id=?",
+                (status, json.dumps(summary, ensure_ascii=False, sort_keys=True) if summary is not None else None,
+                 output_path, output_path, error, started, completed, scan_id),
+            )
+        return self.get_scan_job(scan_id)
+
+    def get_scan_job(self, scan_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM scan_jobs WHERE scan_id=?", (scan_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown scan: {scan_id}")
+        item = dict(row)
+        item["request"] = json.loads(item.pop("request_json"))
+        item["summary"] = json.loads(item.pop("summary_json"))
+        return item
+
+    def list_scan_jobs(self, limit: int = 100) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT scan_id FROM scan_jobs ORDER BY created_at DESC,scan_id DESC LIMIT ?",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [self.get_scan_job(str(row["scan_id"])) for row in rows]
+
+    @staticmethod
+    def _asset_risk(evidence: list[dict]) -> str:
+        rank = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        return max((str(item.get("risk", "INFO")) for item in evidence), key=lambda item: rank.get(item, 0), default="INFO")
+
+    @staticmethod
+    def _asset_pq_status(evidence: list[dict]) -> str:
+        statuses = {str(item.get("pq_status", "unknown")) for item in evidence}
+        if statuses & {"classically_weak", "classically_weak_and_quantum_vulnerable", "quantum_vulnerable"}:
+            return "quantum_vulnerable"
+        if "pqc_or_pqc_candidate" in statuses:
+            return "pqc_or_pqc_candidate"
+        return "unknown"
+
+    def ingest_scan_inventory(self, scan_id: str, inventory: dict, actor: str) -> dict:
+        """Normalize concrete keys/certificates and code artifacts into control-plane assets."""
+        now = utc_now()
+        evidence_rows = [item for item in inventory.get("evidence", []) if isinstance(item, dict)]
+        by_artifact: dict[str, list[dict]] = {}
+        for item in evidence_rows:
+            artifact_id = str(item.get("artifact_id", ""))
+            if artifact_id:
+                by_artifact.setdefault(artifact_id, []).append(item)
+        assets: list[tuple[str, str, str, str, str, str, dict]] = []
+        for item in inventory.get("assets", []):
+            if not isinstance(item, dict) or not item.get("asset_id"):
+                continue
+            assets.append((
+                str(item["asset_id"]), str(item.get("asset_type", "crypto_asset")), str(item.get("path", "")),
+                str(item.get("algorithm", "")), str(item.get("risk", "INFO")), str(item.get("pq_status", "unknown")),
+                {"record_kind": "concrete_asset", **item},
+            ))
+        for item in inventory.get("artifacts", []):
+            if not isinstance(item, dict) or not item.get("artifact_id"):
+                continue
+            rows = by_artifact.get(str(item["artifact_id"]), [])
+            algorithms = sorted({str(row.get("algorithm", "")) for row in rows if row.get("algorithm")})
+            assets.append((
+                str(item["artifact_id"]), str(item.get("artifact_type", "software_artifact")), str(item.get("path", "")),
+                ";".join(algorithms), self._asset_risk(rows), self._asset_pq_status(rows),
+                {"record_kind": "software_artifact", **item, "evidence_count": len(rows), "algorithms": algorithms},
+            ))
+        asset_ids = {item[0] for item in assets}
+        with self.connect() as conn:
+            job = conn.execute("SELECT status FROM scan_jobs WHERE scan_id=?", (scan_id,)).fetchone()
+            if job is None:
+                raise KeyError(f"unknown scan: {scan_id}")
+            for asset_id, asset_type, path, algorithm, risk, pq_status, payload in assets:
+                existing = conn.execute("SELECT created_at FROM crypto_assets WHERE asset_id=?", (asset_id,)).fetchone()
+                created = str(existing["created_at"]) if existing else now
+                conn.execute(
+                    "INSERT INTO crypto_assets(asset_id,latest_scan_id,asset_type,path,algorithm,risk,pq_status,payload_json,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET latest_scan_id=excluded.latest_scan_id,"
+                    "asset_type=excluded.asset_type,path=excluded.path,algorithm=excluded.algorithm,risk=excluded.risk,"
+                    "pq_status=excluded.pq_status,payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                    (asset_id, scan_id, asset_type, path, algorithm, risk, pq_status,
+                     json.dumps(payload, ensure_ascii=False, sort_keys=True), created, now),
+                )
+            conn.execute("DELETE FROM scan_findings WHERE scan_id=?", (scan_id,))
+            for item in inventory.get("findings", []):
+                if not isinstance(item, dict):
+                    continue
+                finding_id = str(item.get("evidence_id") or item.get("asset_id") or "")
+                if not finding_id:
+                    continue
+                linked_asset = str(item.get("artifact_id") or item.get("asset_id") or "") or None
+                if linked_asset not in asset_ids:
+                    linked_asset = None
+                finding_type = str(item.get("evidence_type") or item.get("asset_type") or "finding")
+                conn.execute(
+                    "INSERT INTO scan_findings(scan_id,finding_id,asset_id,finding_type,risk,payload_json) VALUES(?,?,?,?,?,?)",
+                    (scan_id, finding_id, linked_asset, finding_type, str(item.get("risk", "INFO")),
+                     json.dumps(item, ensure_ascii=False, sort_keys=True)),
+                )
+            summary = dict(inventory.get("summary", {}))
+            summary.update({"control_plane_assets": len(assets), "control_plane_findings": len(inventory.get("findings", []))})
+            conn.execute(
+                "UPDATE scan_jobs SET status='SUCCEEDED',summary_json=?,completed_at=?,error=NULL WHERE scan_id=?",
+                (json.dumps(summary, ensure_ascii=False, sort_keys=True), now, scan_id),
+            )
+            self._audit_conn(conn, now, actor, "scan.ingest", "scan_job", scan_id, summary)
+        return self.get_scan_job(scan_id)
+
+    def list_scan_findings(self, scan_id: str, limit: int = 1000) -> list[dict]:
+        self.get_scan_job(scan_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM scan_findings WHERE scan_id=? ORDER BY risk DESC,finding_id LIMIT ?",
+                (scan_id, max(1, min(limit, 10_000))),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def list_crypto_assets(self, limit: int = 500) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT asset_id,latest_scan_id,asset_type,path,algorithm,risk,pq_status,created_at,updated_at "
+                "FROM crypto_assets ORDER BY updated_at DESC,asset_id LIMIT ?",
+                (max(1, min(limit, 5000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_crypto_asset(self, asset_id: str, evidence_limit: int = 1000) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM crypto_assets WHERE asset_id=?", (asset_id,)).fetchone()
+            evidence = conn.execute(
+                "SELECT payload_json FROM scan_findings WHERE asset_id=? ORDER BY scan_id DESC,finding_id LIMIT ?",
+                (asset_id, max(1, min(evidence_limit, 5000))),
+            ).fetchall()
+            assessments = conn.execute(
+                "SELECT assessment_id,risk,result_json,actor,created_at FROM asset_assessments WHERE asset_id=? ORDER BY created_at DESC",
+                (asset_id,),
+            ).fetchall()
+            plans = conn.execute(
+                "SELECT * FROM migration_plans WHERE asset_id=? ORDER BY updated_at DESC", (asset_id,),
+            ).fetchall()
+        if row is None:
+            raise KeyError(f"unknown asset: {asset_id}")
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json"))
+        item["evidence"] = [json.loads(record["payload_json"]) for record in evidence]
+        item["assessments"] = [
+            {**dict(record), "result": json.loads(record["result_json"])} for record in assessments
+        ]
+        for assessment in item["assessments"]:
+            assessment.pop("result_json", None)
+        item["migration_plans"] = []
+        for record in plans:
+            plan = dict(record)
+            plan["plan"] = json.loads(plan.pop("plan_json"))
+            item["migration_plans"].append(plan)
+        return item
+
+    def create_asset_assessment(self, assessment_id: str, asset_id: str, risk: str, result: dict, actor: str) -> dict:
+        self.get_crypto_asset(asset_id, 1)
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO asset_assessments(assessment_id,asset_id,risk,result_json,actor,created_at) VALUES(?,?,?,?,?,?)",
+                (assessment_id, asset_id, risk, json.dumps(result, ensure_ascii=False, sort_keys=True), actor, now),
+            )
+            self._audit_conn(conn, now, actor, "asset.assess", "crypto_asset", asset_id, {"assessment_id": assessment_id, "risk": risk})
+        return {"assessment_id": assessment_id, "asset_id": asset_id, "risk": risk, "result": result, "actor": actor, "created_at": now}
+
+    def upsert_migration_plan(self, plan_id: str, asset_id: str, service_id: str, status: str, plan: dict,
+                              actor: str, compatibility_version: int | None = None, strict_version: int | None = None) -> dict:
+        self.get_crypto_asset(asset_id, 1)
+        now = utc_now()
+        with self.connect() as conn:
+            existing = conn.execute("SELECT created_at FROM migration_plans WHERE plan_id=?", (plan_id,)).fetchone()
+            created = str(existing["created_at"]) if existing else now
+            conn.execute(
+                "INSERT INTO migration_plans(plan_id,asset_id,service_id,status,compatibility_version,strict_version,plan_json,actor,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(plan_id) DO UPDATE SET status=excluded.status,"
+                "compatibility_version=COALESCE(excluded.compatibility_version,migration_plans.compatibility_version),"
+                "strict_version=COALESCE(excluded.strict_version,migration_plans.strict_version),plan_json=excluded.plan_json,"
+                "actor=excluded.actor,updated_at=excluded.updated_at",
+                (plan_id, asset_id, service_id, status, compatibility_version, strict_version,
+                 json.dumps(plan, ensure_ascii=False, sort_keys=True), actor, created, now),
+            )
+            self._audit_conn(conn, now, actor, "migration.plan", "migration_plan", plan_id, {"asset_id": asset_id, "service_id": service_id, "status": status})
+            row = conn.execute("SELECT * FROM migration_plans WHERE plan_id=?", (plan_id,)).fetchone()
+        result = dict(row)
+        result["plan"] = json.loads(result.pop("plan_json"))
+        return result
+
+    def get_migration_plan(self, plan_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM migration_plans WHERE plan_id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown migration plan: {plan_id}")
+        result = dict(row)
+        result["plan"] = json.loads(result.pop("plan_json"))
+        return result
+
     def sync_canonical_resources(self, canonical: dict, policies: list[dict], actor: str, version: int) -> None:
         self.set_setting("service_defaults", canonical.get("defaults", {}), actor)
         service_ids = {service["id"] for service in canonical["services"]}
@@ -445,8 +734,88 @@ class ConfigStore:
     def _prom_escape(value: object) -> str:
         return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
+    def control_plane_summary_metrics(self) -> list[dict]:
+        """Return current inventory and migration counts for dashboards.
+
+        These are gauges because rescans and plan transitions can move records
+        between labels. Runtime traffic counters remain in runtime_metrics.
+        """
+        now = utc_now()
+        rows: list[dict] = []
+
+        def metric(name: str, value: float, labels: dict[str, str], help_text: str) -> None:
+            rows.append({
+                "metric_name": name, "metric_type": "gauge", "help_text": help_text,
+                "metric_value": float(value), "labels": labels, "updated_at": now,
+            })
+
+        with self.connect() as conn:
+            assets = conn.execute(
+                "SELECT risk,pq_status,COUNT(*) AS count FROM crypto_assets GROUP BY risk,pq_status"
+            ).fetchall()
+            scans = {str(row["status"]): int(row["count"]) for row in conn.execute(
+                "SELECT status,COUNT(*) AS count FROM scan_jobs GROUP BY status"
+            ).fetchall()}
+            plans = {str(row["status"]): int(row["count"]) for row in conn.execute(
+                "SELECT status,COUNT(*) AS count FROM migration_plans GROUP BY status"
+            ).fetchall()}
+            states = {str(row["state"]): int(row["count"]) for row in conn.execute(
+                "SELECT state,COUNT(*) AS count FROM service_states GROUP BY state"
+            ).fetchall()}
+            service_count = int(conn.execute("SELECT COUNT(*) FROM service_resources").fetchone()[0])
+            assessment_count = int(conn.execute("SELECT COUNT(*) FROM asset_assessments").fetchone()[0])
+
+        if assets:
+            for row in assets:
+                metric("gateway_crypto_assets", int(row["count"]), {"risk": str(row["risk"]), "pq_status": str(row["pq_status"])}, "Current normalized cryptographic assets by risk and PQ status.")
+        else:
+            metric("gateway_crypto_assets", 0, {"risk": "NONE", "pq_status": "unknown"}, "Current normalized cryptographic assets by risk and PQ status.")
+        for status in ("QUEUED", "RUNNING", "SUCCEEDED", "FAILED"):
+            metric("gateway_scan_jobs", scans.get(status, 0), {"status": status}, "Current enterprise scan jobs by status.")
+        for status in sorted({"COMPATIBILITY_STAGED", "STRICT_STAGED", "VERIFIED", *plans}):
+            metric("gateway_migration_plans", plans.get(status, 0), {"status": status}, "Current scan-driven migration plans by status.")
+        migration_states = {
+            "DISCOVERED", "ASSESSED", "PLANNED", "COMPATIBILITY", "PQC_PREFERRED", "STRICT", "VERIFIED",
+            "DEGRADED", "ROLLED_BACK", "BLOCKED", *states,
+        }
+        for state in sorted(migration_states):
+            metric("gateway_migration_services", states.get(state, 0), {"state": state}, "Current services by migration state.")
+        metric("gateway_managed_services", service_count, {}, "Current first-class Gateway service resources.")
+        metric("gateway_asset_assessments", assessment_count, {}, "Current persisted cryptographic asset assessments.")
+        return rows
+
+    def system_summary(self, stale_after: float = 30.0) -> dict:
+        """Aggregate API-safe day-2 operational state without exposing secrets."""
+        with self.connect() as conn:
+            def grouped(table: str, column: str) -> dict[str, int]:
+                return {str(row["label"]): int(row["count"]) for row in conn.execute(
+                    f"SELECT {column} AS label,COUNT(*) AS count FROM {table} GROUP BY {column}"
+                ).fetchall()}
+
+            counts = {
+                "services": int(conn.execute("SELECT COUNT(*) FROM service_resources").fetchone()[0]),
+                "policies": int(conn.execute("SELECT COUNT(*) FROM policy_resources").fetchone()[0]),
+                "assets": int(conn.execute("SELECT COUNT(*) FROM crypto_assets").fetchone()[0]),
+                "assessments": int(conn.execute("SELECT COUNT(*) FROM asset_assessments").fetchone()[0]),
+            }
+            scans = grouped("scan_jobs", "status")
+            plans = grouped("migration_plans", "status")
+            migrations = grouped("service_states", "state")
+        latest = self.latest_version()
+        if latest:
+            latest = {key: latest.get(key) for key in ("version", "checksum", "created_at", "operator", "status", "rollback_from", "error")}
+        return {
+            "version": "3.6.0",
+            "latest_release": latest,
+            "counts": counts,
+            "scan_jobs": scans,
+            "migration_plans": plans,
+            "migration_states": migrations,
+            "agents": self.list_agents(stale_after),
+        }
+
     def prometheus_text(self) -> str:
-        metrics = self.list_metrics()
+        metrics = self.list_metrics() + self.control_plane_summary_metrics()
         latest = self.latest_version()
         if latest:
             metrics.append({

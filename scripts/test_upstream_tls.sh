@@ -19,32 +19,33 @@ wait_healthy(){
 }
 
 code="$(request_code 12443 upstream-gateway.local /tls-info "$OUT_DIR/verified-before.json")"
-[[ "$code" == 200 ]]
-grep -q '"server_name_received":"upstream-secure.local"' "$OUT_DIR/verified-before.json"
-grep -q 'gateway-upstream-client.local' "$OUT_DIR/verified-before.json"
+verified_sni=false
+verified_identity=false
+grep -q '"server_name_received":"upstream-secure.local"' "$OUT_DIR/verified-before.json" && verified_sni=true
+grep -q 'gateway-upstream-client.local' "$OUT_DIR/verified-before.json" && verified_identity=true
 
 code_bad="$(request_code 13443 badca-gateway.local /tls-info "$OUT_DIR/wrong-ca-body.txt")"
-[[ "$code_bad" == 502 ]]
 code_missing="$(request_code 14443 upstream-noclient-gateway.local /tls-info "$OUT_DIR/missing-client-cert-body.txt")"
-[[ "$code_missing" == 502 ]]
 
 ./certs/rotate-upstream-server-cert.sh ./certs/upstream | tee "$OUT_DIR/certificate-rotation.json"
 grep -q '"rotated":true' "$OUT_DIR/certificate-rotation.json"
 docker compose restart secure-backend >/dev/null
 wait_healthy
 code_after="$(request_code 12443 upstream-gateway.local /tls-info "$OUT_DIR/verified-after.json")"
-[[ "$code_after" == 200 ]]
-grep -q '"server_name_received":"upstream-secure.local"' "$OUT_DIR/verified-after.json"
+verified_after_sni=false
+grep -q '"server_name_received":"upstream-secure.local"' "$OUT_DIR/verified-after.json" && verified_after_sni=true
 
-python3 - "$OUT_DIR" "$code" "$code_bad" "$code_missing" "$code_after" <<'PY'
+python3 - "$OUT_DIR" "$code" "$code_bad" "$code_missing" "$code_after" \
+  "$verified_sni" "$verified_identity" "$verified_after_sni" <<'PY'
 import json,sys,time
 from pathlib import Path
 r=Path(sys.argv[1]);rotation=json.loads((r/'certificate-rotation.json').read_text())
+verified_sni=sys.argv[6]=='true';verified_identity=sys.argv[7]=='true';verified_after_sni=sys.argv[8]=='true'
 rows=[
- {'test':'verified_ca_sni_upstream_mtls','status':'PASS' if sys.argv[2]=='200' else 'FAIL','http_status':int(sys.argv[2])},
+ {'test':'verified_ca_sni_upstream_mtls','status':'PASS' if sys.argv[2]=='200' and verified_sni and verified_identity else 'FAIL','http_status':int(sys.argv[2]),'sni_verified':verified_sni,'client_identity_verified':verified_identity},
  {'test':'wrong_upstream_ca_rejected','status':'PASS' if sys.argv[3]=='502' else 'FAIL','http_status':int(sys.argv[3])},
  {'test':'missing_upstream_client_certificate_rejected','status':'PASS' if sys.argv[4]=='502' else 'FAIL','http_status':int(sys.argv[4])},
- {'test':'upstream_certificate_rotation','status':'PASS' if sys.argv[5]=='200' and rotation.get('rotated') else 'FAIL','http_status':int(sys.argv[5]),**rotation},
+ {'test':'upstream_certificate_rotation','status':'PASS' if sys.argv[5]=='200' and verified_after_sni and rotation.get('rotated') else 'FAIL','http_status':int(sys.argv[5]),'sni_verified':verified_after_sni,**rotation},
 ]
 p={'generated_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'summary':{'tests':len(rows),'passed':sum(x['status']=='PASS' for x in rows),'failed':sum(x['status']=='FAIL' for x in rows)},'results':rows}
 (r/'upstream-tls-matrix.json').write_text(json.dumps(p,indent=2)+'\n');print(json.dumps(p['summary'],indent=2));raise SystemExit(0 if p['summary']['failed']==0 else 1)

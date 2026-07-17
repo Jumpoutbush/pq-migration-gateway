@@ -50,7 +50,7 @@ class HttpAdapter(ProtocolAdapter):
 
 {chr(10).join(upstream_tls_lines(service))}
 
-        add_header X-PQ-Gateway "pqc-migration-gateway-v3.3" always;
+        add_header X-PQ-Gateway "pqc-migration-gateway-v3.6" always;
         add_header X-PQ-Service {json.dumps(sid)} always;
         add_header X-PQ-TLS-Groups {json.dumps(groups)} always;
 

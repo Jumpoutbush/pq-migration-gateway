@@ -4,6 +4,10 @@ certs/*.crt
 certs/*.csr
 certs/*.srl
 certs/*.ext
+/certs/**/*.key
+/certs/**/*.crt
+/certs/**/*.csr
+/certs/**/*.srl
 certs/mldsa-demo/
 
 # Generated scans, databases, and experiments.
@@ -47,6 +51,10 @@ __pycache__/
 /runtime-data/alerts/*
 !/runtime-data/alerts/.gitkeep
 
+# Enterprise runtime data
+/runtime-data/enterprise/*
+!/runtime-data/enterprise/.gitkeep
+
 # SQLite side files
 *.db
 *.db-wal
@@ -54,3 +62,8 @@ __pycache__/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Enterprise local configuration and secrets
+/.env.enterprise
+/customer-service.json
+/config/enterprise/services.json

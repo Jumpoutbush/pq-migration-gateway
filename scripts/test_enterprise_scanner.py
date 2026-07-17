@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the v3.3 enterprise crypto discovery experiment matrix."""
+"""Run the v3.6 enterprise crypto discovery experiment matrix."""
 from __future__ import annotations
 
 import argparse
@@ -27,29 +27,38 @@ def main() -> int:
     subprocess.run([
         sys.executable, str(ROOT / "scripts/crypto_inventory.py"),
         "--root", manifest["source_root"], "--root", manifest["binary_root"],
+        "--compile-commands", manifest["compile_commands"],
+        "--ebpf-trace-file", manifest["ebpf_trace"],
         "--scan-processes", "--proc-root", manifest["proc_root"],
         "--out-json", str(inventory_json), "--out-csv", str(inventory_csv),
     ], check=True)
     inventory = json.loads(inventory_json.read_text(encoding="utf-8"))
     evidence = inventory["evidence"]
+    artifacts = inventory["artifacts"]
 
     def has(**expected: str) -> bool:
         return any(all(str(row.get(key, "")) == value for key, value in expected.items()) for row in evidence)
 
     tests = [
         ("cpp_source_openssl", has(language="cpp", method="SSL_CTX_new", source="source_parser")),
+        ("cpp_compile_commands", inventory["summary"].get("compile_database_entries", 0) >= 1),
+        ("cpp_macro_expansion", has(language="cpp", method="SSL_CTX_new", source="cpp_macro_expansion")),
+        ("cpp_call_graph", any(row["source"] == "cpp_call_graph" and "migration_wrapper" in row["method"] for row in evidence)),
         ("java_source_jca", has(language="java", method="Cipher.getInstance", source="source_parser")),
         ("rust_source_rustls", has(language="rust", method="rustls::ClientConfig::builder", source="source_parser")),
         ("go_source_tls", has(language="go", method="tls.Config", source="source_parser")),
         ("python_source_ssl", has(language="python", method="ssl.SSLContext", source="source_parser")),
         ("shell_source_openssl", has(language="shell", method="openssl s_client", source="source_parser")),
         ("native_elf_openssl", any(row["method"].startswith("SSL_CTX_") and row["artifact_type"] == "native_executable" for row in evidence)),
+        ("cpp_static_archive_symbols", any(Path(row["path"]).name == "libcpp-crypto.a" and row["method"] == "SSL_CTX_new" for row in evidence)),
+        ("cpp_symbol_demangling", any(any("CryptoPP::RSA::Encrypt" in symbol for symbol in row.get("demangled_symbols", [])) for row in artifacts)),
         ("java_jar_jsse", has(language="java", method="javax/net/ssl/SSLContext", source="class_constants")),
         ("go_binary_interface", any(Path(row["path"]).name == "go-service" and row["language"] == "go" and row["method"].startswith("crypto/tls") for row in evidence)),
         ("rust_binary_interface", any(Path(row["path"]).name == "rust-service" and row["language"] == "rust" and row["method"].startswith(("rustls::", "ring::")) for row in evidence)),
         ("extensionless_python", any(Path(row["path"]).name == "python-service" and row["language"] == "python" for row in evidence)),
         ("extensionless_shell", any(Path(row["path"]).name == "shell-service" and row["language"] == "shell" for row in evidence)),
         ("runtime_proc_maps", any(row["source"] == "proc_maps" and row["method"] == "libssl.so.3" for row in evidence)),
+        ("ebpf_runtime_interface", any(row["source"] == "ebpf_uprobe" and row["method"] == "RSA_public_encrypt" for row in evidence)),
         ("target_never_executed", not Path(manifest["execution_marker"]).exists()),
         ("json_and_csv_outputs", inventory_json.stat().st_size > 0 and inventory_csv.stat().st_size > 0),
     ]
@@ -62,6 +71,7 @@ def main() -> int:
         "fixture_mode": manifest["native_fixture_mode"],
         "fixture_modes": {
             "cpp": manifest["native_fixture_mode"],
+            "cpp_static_archive": manifest["static_archive_mode"],
             "go": manifest["go_fixture_mode"],
             "rust": manifest["rust_fixture_mode"],
             "java": manifest["java_fixture_mode"],

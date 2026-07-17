@@ -1,5 +1,57 @@
 # Changelog
 
+## 3.6.0
+
+### API-first enterprise control plane
+
+- Added public OpenAPI 3.1 contract and authenticated capability discovery.
+- Added aggregated system status and clear `/v1/releases` aliases while preserving `/v1/configs` compatibility.
+- Added one-call service validation, registration and signed release staging through `/v1/onboarding` and `/v1/services/{id}/publish`.
+- Added a dependency-free Python REST client and `pqapi` automation CLI with no SQLite access.
+- Converted enterprise apply, history, rollback, status, scan, asset and audit wrappers to REST calls.
+- Added a deterministic 14-case API-first onboarding, scan, migration, status and rollback experiment.
+- Fixed the Dockerfile undefined `LD_LIBRARY_PATH` warning and improved invalid scan-root guidance.
+
+## 3.5.0
+
+### Enterprise delivery
+
+- Added an independent, hardened enterprise Compose runtime without demo backends.
+- Added idempotent `make enterprise-init` and interactive/automatable `pqctl onboard` flows.
+- Added enterprise apply, history, rollback, scan, asset, status and log commands.
+- Added a signed initial release and isolated enterprise runtime directories.
+
+### Continuous observability
+
+- Added an optional Prometheus/Grafana deployment profile and provisioned migration dashboard.
+- Added control-plane asset, assessment, scan, migration-plan and migration-state gauges.
+- Added Agent, fallback, TLS handshake and upstream TLS alert rules.
+- Added an end-to-end enterprise onboarding, traffic cutover, observation and rollback guide.
+
+## 3.4.0
+
+### Scan-to-Migration orchestration
+
+- Added authenticated asynchronous scan, finding and asset REST resources.
+- Added persistent scan jobs, normalized software assets, assessments and migration plans to the control-plane SQLite schema.
+- Connected a discovered C++/RSA/OpenSSL artifact to assessment, compatibility release publication, migration-state transitions and strict PQC promotion.
+- Added strict-promotion gates requiring a healthy compatibility release, explicit verification and an acceptable fallback rate.
+- Added a deterministic 10-case REST workflow experiment.
+
+### Advanced C++ discovery
+
+- Added safe `compile_commands.json` metadata parsing without executing compilation commands.
+- Added bounded macro alias expansion and a confidence-labeled heuristic C++ call graph.
+- Added static archive member/symbol inspection with `ar` and `nm`.
+- Added C++ symbol demangling with `c++filt` for ELF and static archives.
+- Added optional fixed, bounded eBPF/bpftrace uprobe observation plus offline trace import.
+- Expanded the enterprise scanner experiment from 15 to 21 cases.
+
+### Reliability
+
+- Fixed persistent TCP protocol benchmark sessions by terminating `s_client` after the expected response.
+- Preserved mTLS client certificate/key arguments in protocol performance tests.
+
 ## 3.3.1
 
 - Fixed the enterprise experiment assertion to accept Go and Rust interface evidence from either real compiled ELF symbol tables or bounded binary strings.

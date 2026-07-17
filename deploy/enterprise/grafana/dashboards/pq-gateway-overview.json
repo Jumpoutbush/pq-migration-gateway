@@ -1,0 +1,186 @@
+{
+  "annotations": {"list": []},
+  "description": "Enterprise crypto discovery, PQC migration rollout and Gateway runtime health.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "All normalized source, binary, certificate and key assets in the control plane.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(gateway_crypto_assets)", "refId": "A"}],
+      "title": "Crypto assets",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "Assets containing quantum-vulnerable algorithms or interfaces.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(gateway_crypto_assets{pq_status=\"quantum_vulnerable\"})", "refId": "A"}],
+      "title": "Quantum-vulnerable assets",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "Share of observed handshakes using X25519MLKEM768.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "decimals": 1, "max": 1, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.8}, {"color": "green", "value": 0.99}]}, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "avg(gateway_hybrid_adoption_ratio)", "refId": "A"}],
+      "title": "Hybrid PQC adoption",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "Total observed classical X25519 fallback handshakes.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 100}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(gateway_classical_fallback_total)", "refId": "A"}],
+      "title": "Classical fallbacks",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "Current health reported by all Gateway agents.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "max": 1, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 0},
+      "id": 5,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["min"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "min(gateway_agent_health)", "refId": "A"}],
+      "title": "Gateway health",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "description": "Latest immutable configuration release and lifecycle state.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 0},
+      "id": 6,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "name"},
+      "targets": [{"expr": "gateway_config_info", "legendFormat": "v{{version}} {{status}}", "refId": "A"}],
+      "title": "Configuration release",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 12, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (service, group) (gateway_tls_group_total{service=~\"$service\"})", "legendFormat": "{{service}} / {{group}}", "refId": "A"}],
+      "title": "Negotiated TLS groups",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "gateway_tls_handshake_failures_total", "legendFormat": "TLS handshake", "refId": "A"},
+        {"expr": "gateway_mtls_failures_total", "legendFormat": "mTLS", "refId": "B"},
+        {"expr": "gateway_upstream_tls_failures_total", "legendFormat": "Upstream TLS", "refId": "C"}
+      ],
+      "title": "TLS failure counters",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}, "mappings": []}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 13},
+      "id": 9,
+      "options": {"displayLabels": ["name", "value"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "sum by (risk, pq_status) (gateway_crypto_assets)", "legendFormat": "{{risk}} / {{pq_status}}", "refId": "A"}],
+      "title": "Asset risk and PQ status",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}, "mappings": []}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 13},
+      "id": 10,
+      "options": {"displayLabels": ["name", "value"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "sum by (status) (gateway_scan_jobs)", "legendFormat": "{{status}}", "refId": "A"}],
+      "title": "Enterprise scan jobs",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}, "mappings": []}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 13},
+      "id": 11,
+      "options": {"displayLabels": ["name", "value"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "sum by (status) (gateway_migration_plans)", "legendFormat": "{{status}}", "refId": "A"}],
+      "title": "Migration plans",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "gateway_active_connections", "legendFormat": "active / {{agent_id}}", "refId": "A"},
+        {"expr": "gateway_classical_fallback_ratio", "legendFormat": "fallback ratio / {{agent_id}}", "refId": "B"}
+      ],
+      "title": "Agent traffic and fallback",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}, "mappings": []}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "id": 13,
+      "options": {"displayLabels": ["name", "value"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "sum by (state) (gateway_migration_services)", "legendFormat": "{{state}}", "refId": "A"}],
+      "title": "Service migration states",
+      "type": "piechart"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["pqc", "migration", "enterprise"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "pqc-prometheus"},
+        "definition": "label_values(gateway_tls_group_total, service)",
+        "includeAll": true,
+        "label": "Service",
+        "multi": true,
+        "name": "service",
+        "options": [],
+        "query": {"query": "label_values(gateway_tls_group_total, service)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "PQC Migration Gateway — Enterprise Overview",
+  "uid": "pqc-enterprise-overview",
+  "version": 1,
+  "weekStart": ""
+}
