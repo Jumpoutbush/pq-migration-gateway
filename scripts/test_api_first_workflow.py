@@ -26,7 +26,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir", nargs="?", default="experiment-results/manual-api-first")
     args = parser.parse_args()
-    out = Path(args.out_dir)
+    urllib.request.install_opener(
+        urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+    )
+    out = Path(args.out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
 

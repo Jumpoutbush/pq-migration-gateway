@@ -25,6 +25,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output")
     args = parser.parse_args()
+    urllib.request.install_opener(
+        urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+    )
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     fixtures = output / "fixtures"
@@ -65,7 +70,29 @@ def main() -> int:
             with urllib.request.urlopen(req, timeout=15) as response:
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as exc:
-            return exc.code, json.loads(exc.read())
+            raw = exc.read()
+            text = raw.decode("utf-8", errors="replace")
+
+            print(
+                f"{method} {path} -> HTTP {exc.code} {exc.reason}; "
+                f"body={text!r}"
+            )
+
+            if text.strip():
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    payload = {
+                        "error": "non_json_error_response",
+                        "body": text,
+                    }
+            else:
+                payload = {
+                    "error": "empty_error_response",
+                    "reason": str(exc.reason),
+                }
+
+            return exc.code, payload
 
     def record(name: str, passed: bool, details: object = None) -> None:
         tests.append({"test": name, "status": "PASS" if passed else "FAIL", "details": details})
@@ -75,6 +102,11 @@ def main() -> int:
             "type": "enterprise", "roots": [str(fixtures)], "compile_commands": [str(database)],
         })
         record("create_scan_api", status == 202, {"status": status, "scan_id": job.get("scan_id")})
+        if status != 202 or not job.get("scan_id"):
+            raise RuntimeError(
+                f"scan creation failed: HTTP {status}, response={job!r}"
+            )
+        scan_id = job["scan_id"]
         for _ in range(200):
             _, job = request("GET", f"/v1/scans/{job['scan_id']}")
             if job.get("status") in {"SUCCEEDED", "FAILED"}:
@@ -120,6 +152,8 @@ def main() -> int:
         })
         record("migration_verified", status == 202 and completed.get("status") == "VERIFIED", completed.get("status"))
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         record("workflow_exception", False, str(exc))
     finally:
         server.shutdown()
