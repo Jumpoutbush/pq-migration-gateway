@@ -1,248 +1,438 @@
-# PQC Migration Gateway v3.6 — API-First Enterprise Control Plane
+# PQC Migration Gateway v3.6
 
-一个面向异构存量系统的后量子迁移基础设施原型。项目不实现具体金融业务，而是提供：
+面向异构存量系统的后量子迁移与密码资产发现原型。
 
-- 密码资产发现与风险评估；
-- TLS 1.3 Hybrid/PQC 接入；
-- 经典客户端兼容回退；
-- HTTP/HTTPS、MQTT、通用 TCP 和非 HTTP 遗留协议代理；
-- 客户端 mTLS 与网关到上游的 HTTPS/mTLS；
-- 企业网段、批量端点和 CMDB 资产扫描；
-- 持续扫描、配置验证、运行时回退统计；
-- 完整功能与性能实验。
+本项目提供后量子 TLS 接入、经典客户端兼容、企业密码资产扫描、风险评估、迁移编排、配置发布、运行监测和回滚能力。项目不实现具体金融业务，企业可以将已有的 HTTP、HTTPS、TCP、MQTT、消息队列、数据库和遗留协议服务接入网关。
 
-v3.6 将企业启动后的控制操作统一为 REST API：服务接入与原子发布、扫描、资产评估、迁移、发布历史、状态、审计和回滚都不再要求直接操作 SQLite 或逐条执行内部命令。新增 OpenAPI 合同、能力发现、聚合状态和纯 REST Python 客户端；v3.5 企业部署与 Grafana、v3.4 扫描到迁移闭环继续兼容。
+网关基于：
 
-网关使用 **NGINX 1.28.0 + OpenSSL 3.5.0**。默认迁移策略为：
+- NGINX 1.28.0；
+- OpenSSL 3.5.0；
+- TLS 1.3；
+- `X25519MLKEM768` Hybrid 密钥交换；
+- `X25519` 经典兼容回退。
+
+默认兼容策略：
 
 ```text
 X25519MLKEM768:X25519
 ```
 
-支持 PQC 的客户端优先使用 `X25519MLKEM768`，尚未升级的客户端可以回退到 `X25519`。严格入口只允许 `X25519MLKEM768`。
+严格策略：
+
+```text
+X25519MLKEM768
+```
 
 ---
 
-## 1. v3.6 功能
+# 第一部分：整体框架介绍
 
-### 1.0 企业快速接入
+## 1. 项目解决的问题
+
+企业通常无法同时升级所有客户端、后端服务、密码库、证书体系和应用代码。本项目采用“资产驱动、网关过渡、兼容优先、验证后收紧”的迁移路线：
+
+```text
+发现密码资产
+    ↓
+识别算法、证书、密码库和网络端点
+    ↓
+风险评估
+    ↓
+确定需要保护的业务入口
+    ↓
+部署 PQC Gateway
+    ↓
+兼容模式：Hybrid 优先，经典可用
+    ↓
+统计真实 Hybrid 使用率和经典回退率
+    ↓
+升级、代理或隔离旧客户端
+    ↓
+严格模式：只允许 Hybrid
+    ↓
+继续升级网关到后端及应用内部密码资产
+```
+
+网关首先升级客户端到企业入口这一段 TLS。企业原后端可以暂时保持 HTTP 或经典 TLS，待业务稳定后再继续迁移。
+
+## 2. 两段独立连接
+
+Gateway 会终止客户端 TLS，并重新建立到企业后端的连接：
+
+```text
+客户端
+   │
+   │ 下游连接：Hybrid TLS 或经典 TLS
+   ▼
+PQC Gateway
+   │
+   │ 上游连接：HTTP、经典 TLS、mTLS 或 Hybrid TLS
+   ▼
+企业原业务服务
+```
+
+两段连接独立配置：
+
+| 连接段 | 典型初始状态 | 迁移目标 |
+|---|---|---|
+| 客户端 → Gateway | `X25519MLKEM768:X25519` | 严格 `X25519MLKEM768` |
+| Gateway → 企业后端 | 原有 HTTP 或经典 TLS | TLS、mTLS、Hybrid TLS |
+
+如果客户端和服务器都只支持经典 TLS，单独增加服务器侧网关不能凭空产生后量子保护。至少需要客户端或客户端侧代理支持 Hybrid，客户端到网关这一段才能使用 `X25519MLKEM768`。
+
+## 3. 兼容模式和严格模式
+
+### 3.1 兼容模式
+
+```json
+{
+  "mode": "compatibility",
+  "groups": [
+    "X25519MLKEM768",
+    "X25519"
+  ]
+}
+```
+
+TLS 握手时：
+
+- 支持 Hybrid 的客户端协商 `X25519MLKEM768`；
+- 只支持经典算法的客户端协商 `X25519`；
+- 没有共同算法时握手失败。
+
+网关不会扫描客户端程序，也不会先建立一次失败连接再重新连接。TLS 根据双方提供的算法组完成能力协商，网关记录最终协商结果。
+
+### 3.2 严格模式
+
+```json
+{
+  "mode": "strict",
+  "groups": [
+    "X25519MLKEM768"
+  ]
+}
+```
+
+严格模式只接受 Hybrid。只支持 `X25519` 的客户端会被拒绝。
+
+默认 pilot 证书仍可能使用 RSA。严格模式当前主要约束 TLS 1.3 密钥交换组，不代表服务器身份认证证书已经全部迁移为后量子签名。
+
+## 4. 客户端如何接入网关
+
+客户端原来访问：
+
+```text
+payment.internal:8080
+```
+
+接入后访问：
+
+```text
+payment-gateway.company.local:28443
+```
+
+常见切流方法：
+
+- 修改客户端访问地址；
+- 修改 DNS 记录；
+- 修改负载均衡器转发目标；
+- 保持原域名，将原域名解析到 Gateway；
+- 对无法修改的旧客户端部署本地代理。
+
+当前测试客户端主要由 OpenSSL `s_client`、curl 和协议测试脚本实现。客户端角色是模拟的，但 TLS 握手、证书验证、密钥交换和数据传输均由真实 OpenSSL 执行。
+
+## 5. 核心组件
+
+```text
+PQC Migration Gateway
+├── Gateway 数据面
+│   ├── TLS 终止
+│   ├── Hybrid/经典协商
+│   ├── HTTP/Stream 代理
+│   └── mTLS 与上游 TLS
+├── Manager API 控制面
+│   ├── 服务接入
+│   ├── 扫描任务
+│   ├── 资产与证据
+│   ├── 风险评估
+│   ├── 迁移计划
+│   ├── 配置发布
+│   ├── 状态与审计
+│   └── 回滚
+├── Gateway Agent
+│   ├── 配置签名和校验和验证
+│   ├── NGINX 候选配置生成
+│   ├── nginx -t
+│   ├── reload
+│   └── 健康检查
+├── Scanner
+│   ├── 源码和配置扫描
+│   ├── 二进制、动态库和静态库扫描
+│   ├── 证书和密钥元数据扫描
+│   ├── CMDB/CIDR/在线 TLS 扫描
+│   └── 可选进程映射和 eBPF 证据
+└── Metrics Agent
+    ├── Hybrid 使用量
+    ├── 经典回退率
+    ├── TLS/mTLS 错误
+    └── 发布与 Agent 状态
+```
+
+## 6. 数据面接口和管理接口
+
+业务客户端访问 Gateway 监听端口，例如：
+
+```text
+https://payment-gateway.company.local:28443
+```
+
+企业管理员访问 Manager API：
+
+```text
+http://127.0.0.1:18080
+```
+
+两类接口含义不同：
+
+| 接口 | 用途 | 默认保护 |
+|---|---|---|
+| Gateway `28443` | 真实业务流量 | TLS 1.3 Hybrid/兼容 |
+| Manager API `18080` | 扫描、资产、迁移、发布和回滚 | 本机回环 HTTP + Token |
+
+`POST /v1/scans` 是 HTTP REST 请求，不是 Shell 命令或直接 Python 函数。Make 命令和 `pqapi.py` 是它的客户端封装：
+
+```text
+make enterprise-scan
+        ↓
+manager/pqapi.py scan create
+        ↓
+POST http://127.0.0.1:18080/v1/scans
+        ↓
+Manager API 调用扫描编排器
+```
+
+## 7. 主要 REST API
+
+| HTTP 接口 | 作用 |
+|---|---|
+| `POST /v1/scans` | 创建异步企业扫描任务 |
+| `GET /v1/scans` | 查询扫描任务 |
+| `GET /v1/scans/{id}/findings` | 查询文件、符号和接口证据 |
+| `GET /v1/assets` | 查询归一化密码资产 |
+| `POST /v1/assets/{id}/assess` | 风险评估 |
+| `POST /v1/assets/{id}/migration` | 创建、验证或完成迁移计划 |
+| `POST /v1/onboarding` | 接入并发布 Gateway 服务 |
+| `GET /v1/status` | 聚合系统状态 |
+| `GET /v1/releases` | 发布历史 |
+| `POST /v1/releases/{version}/rollback` | 回滚历史版本 |
+| `GET /v1/audit` | 审计事件 |
+
+`POST`、`GET` 等 HTTP 方法本身没有经典或后量子属性。是否获得后量子保护取决于外层 TLS。当前 `18080` 只面向本机管理；远程开放时应增加 HTTPS、mTLS、防火墙和访问控制。
+
+## 8. 支持的业务协议
+
+| 适配器 | 使用场景 |
+|---|---|
+| `http` | HTTP/HTTPS 服务 |
+| `tcp` | 通用 TCP 服务 |
+| `mqtt` | MQTT 消息服务 |
+| `amqp` | AMQP 消息服务 |
+| `kafka` | Kafka |
+| `mysql` | MySQL |
+| `postgres` | PostgreSQL |
+| `redis` | Redis |
+| `generic-stream` | 通用长连接协议 |
+| `legacy-line` | 行式遗留协议 |
+
+业务协议需要企业在服务配置中明确指定。网关不会在生产流量中自动尝试 HTTP、HTTPS、MQTT 等协议，也不会在 HTTPS 失败后自动降级为 HTTP。
+
+## 9. 密码资产扫描能力
+
+扫描器支持多层证据：
+
+- C、C++、Java、Rust、Go、Python、Shell 源码；
+- TLS、NGINX、Apache、YAML、JSON、TOML、XML 等配置；
+- X.509 证书和 PEM 私钥元数据；
+- `compile_commands.json` 编译上下文；
+- 有界宏展开和启发式调用关系；
+- ELF、PE、Mach-O 和 WebAssembly；
+- `.so` 动态库和 `.a` 静态库；
+- JAR、WAR、EAR 和 Java class；
+- 动态依赖、导入符号、字符串和 C++ 名称反修饰；
+- Go、Rust 编译程序中的包路径和密码标记；
+- `/proc/<pid>/maps` 运行进程映射；
+- 可选固定 eBPF 探针事件；
+- CMDB CSV/JSON 导入；
+- CIDR 网段发现；
+- 在线 TLS、证书和 group 探测。
+
+扫描器不执行目标程序，不执行 `compile_commands.json`，不保存私钥内容。扫描证据分为高、中等置信度，字符串命中不代表接口一定被执行。
+
+## 10. 扫描到迁移闭环
+
+```text
+POST /v1/scans
+    ↓
+GET /v1/assets
+    ↓
+POST /v1/assets/{id}/assess
+    ↓
+POST /v1/assets/{id}/migration
+    ↓
+发布兼容模式
+    ↓
+验证 Hybrid 和经典客户端
+    ↓
+观察回退率并升级旧客户端
+    ↓
+发布严格模式
+    ↓
+验证 Hybrid 成功、经典失败、业务正常
+    ↓
+VERIFIED 或回滚
+```
+
+扫描器不会自动猜测监听端口、域名、上游地址和业务负责人。这些业务接入信息由企业通过服务配置或 CMDB 提供。
+
+## 11. 发布与迁移状态
+
+配置发布状态：
+
+```text
+DRAFT → VALIDATED → STAGED → APPLIED → HEALTHY
+```
+
+迁移状态：
+
+```text
+DISCOVERED → ASSESSED → PLANNED → COMPATIBILITY
+           → PQC_PREFERRED → STRICT → VERIFIED
+```
+
+发布失败时可能进入：
+
+```text
+VALIDATION_FAILED
+NGINX_TEST_FAILED
+RELOAD_FAILED
+HEALTH_CHECK_FAILED
+ROLLED_BACK
+```
+
+`STAGED` 只表示候选配置已生成并等待 Agent 应用。只有 `current_version` 与 `desired_version` 相同且状态为 `HEALTHY`，新版本才已真正生效。
+
+## 12. 普通实验环境和 Enterprise 环境
+
+| 环境 | 用途 | 后端 |
+|---|---|---|
+| `run_full_experiment.sh` | 自动功能、安全和性能验证 | 项目模拟后端 |
+| Enterprise | 长期运行和企业手工/API 接入 | 企业真实或临时后端 |
+
+两套环境共用代码和 Docker 镜像，但使用不同 Compose 配置、容器、运行数据和服务对象。通常交替运行，避免争用 `18080`、`8443` 等端口。
+
+Enterprise 不是模拟企业实体，也不是单独的下游接口。它是一套包含 Gateway、Manager API、Metrics Agent、数据库和持久化目录的企业部署方式。
+
+## 13. 项目边界
+
+当前版本是单节点企业试点框架。生产化还需要：
+
+- 企业 PKI；
+- 后量子证书体系；
+- HSM/KMS；
+- 密钥轮换和吊销；
+- 高可用、负载均衡和多节点一致性；
+- WAF、DDoS 防护和限流；
+- SIEM 和审计留存；
+- 大规模 CMDB、证书平台和监控平台集成；
+- 经授权的生产网段扫描策略；
+- 针对真实数据库、消息队列和专有协议的兼容性验证。
+
+Gateway 保护经过它的网络连接，不会自动将应用内部的 RSA 签名、文件加密、数据库字段加密或业务报文签名替换为后量子算法。
+
+---
+
+# 第二部分：环境配置
+
+## 14. 推荐环境
+
+- Windows Subsystem for Linux 2（WSL2）Ubuntu 24.04；
+- Docker Engine；
+- Docker Compose V2；
+- Python 3.12；
+- curl；
+- make；
+- Git；
+- unzip；
+- `rg`（ripgrep，推荐）。
+
+安装基础依赖：
 
 ```bash
-make build
-make enterprise-init SCAN_ROOT="$PWD" SERVER_NAME=pqc-gateway.company.local LISTEN_PORT=28443
-make enterprise-up
-make enterprise-capabilities
-make enterprise-api-onboard SERVICE_FILE=customer-service.json
-make enterprise-scan
-make dashboard-up
+sudo apt update
+sudo apt install -y \
+  ca-certificates \
+  curl \
+  git \
+  make \
+  unzip \
+  python3 \
+  docker.io \
+  docker-compose-v2 \
+  ripgrep
 ```
 
-企业运行环境不会启动演示银行、MQTT、TCP 或安全后端。API 合同在 `GET /openapi.json`，完整调用流程见 `docs/api-first.md` 和 `docs/enterprise-quickstart.md`。
+将当前用户加入 Docker 用户组：
 
-### 1.1 控制面运行时
-
-- Service 与 Policy 资源持久化、查询、更新和删除；
-- 配置发布状态：`DRAFT → VALIDATED → STAGED → APPLIED → HEALTHY`；
-- 验证、`nginx -t`、reload、健康检查失败分别记录；
-- Gateway Agent 心跳、当前/期望配置版本、健康和 reload 结果上报；
-- `/metrics` 暴露发布、Agent、TLS group、经典回退和 TLS/mTLS 错误指标；
-- `pqapi` 为纯 REST 自动化客户端；`pqctl` 仅保留离线初始化、开发和故障诊断用途；
-- REST API 支持异步扫描任务、资产/证据查询、风险评估和迁移计划；
-- 严格模式发布受兼容版本健康状态、验证结果和回退率共同约束。
-
-### 1.2 通用接入
-
-| 接入类型 | 实现方式 | 示例端口 |
-|---|---|---:|
-| HTTP/HTTPS | NGINX HTTP TLS 终止与反向代理 | 8443、9443 |
-| 客户端 mTLS | `off`、`optional`、`required` | 10443、11443 |
-| 上游 HTTPS | CA 校验、SNI、网关客户端证书 | 12443 |
-| 错误 CA 测试 | 上游证书校验必须失败 | 13443 |
-| 缺少上游客户端证书 | 上游 mTLS 必须失败 | 14443 |
-| MQTT TLS | NGINX Stream TLS 终止 | 8883 |
-| 通用 TCP TLS | NGINX Stream TLS 终止 | 15443 |
-| 非 HTTP 遗留协议 | 透明转发示例 | 16443 |
-
-所有业务载荷均被视为不透明数据。新增系统主要通过 `config/services.json` 配置，不要求修改网关源码。
-
-### 1.3 企业密码资产发现
-
-支持：
-
-- X.509 证书、私钥、TLS 配置和源码引用扫描；
-- C/C++、Java、Rust、Go、Python、Shell 接口/方法级识别；
-- C++ 编译数据库元数据、有界宏展开和启发式调用关系；
-- ELF/PE/Mach-O/静态库的依赖、导入符号和受限字符串检查；
-- 静态库成员/符号及 C++ `c++filt` 名称反修饰；
-- JAR/WAR/EAR 类常量检查，不加载或执行 Java 类；
-- 无扩展名脚本和按文件魔数识别的原生可执行程序；
-- 可选 `/proc/<pid>/maps` 运行进程与密码库关联；
-- 可选导入 eBPF 事件，或显式启用固定、限时的 uprobe 观测；
-- 证据置信度、来源、语言、库、方法、算法和制品 SHA-256；
-- 单端点和批量端点输入；
-- CSV/JSON CMDB 资产导入；
-- CIDR 网段与端口发现；
-- 并发在线 TLS 端点扫描；
-- TLS 版本、证书算法、密钥长度和 TLS group 探测；
-- SQLite 资产、证据、端点、CMDB 与风险数据归一化；
-- 定时持续扫描、快照保存和变化对比。
-
-### 1.4 运行时迁移监测
-
-HTTP 与 Stream 日志持久保存在：
-
-```text
-runtime-data/logs/
+```bash
+sudo usermod -aG docker "$USER"
+newgrp docker
 ```
 
-`metrics-agent` 持续生成：
+检查：
 
-```text
-runtime-data/metrics/current.json
-runtime-data/metrics/history.jsonl
-runtime-data/metrics/pqc_gateway.prom
+```bash
+docker version
+docker compose version
+python3 --version
 ```
 
-统计范围是网关实际运行期间的全部连接，而不局限于实验脚本流量。指标包括：
-
-- Hybrid/PQC 连接数；
-- X25519 经典回退数；
-- 全局和按服务的 Hybrid 使用率；
-- 按 HTTP、MQTT、TCP、遗留协议分类；
-- 按客户端地址汇总。
-
-### 1.5 完整安全实验
-
-一键实验覆盖：
-
-- 兼容入口的 Hybrid/PQC 与 X25519；
-- 严格入口接受 Hybrid/PQC、拒绝 X25519；
-- mTLS 的关闭、可选、强制、有效证书、无证书和错误 CA；
-- 上游 HTTPS 证书验证；
-- 上游 SNI；
-- 网关到上游的 mTLS；
-- 错误上游 CA 拒绝；
-- 缺少上游客户端证书拒绝；
-- 上游证书轮换；
-- MQTT 发布/订阅；
-- TCP echo；
-- 非 HTTP 遗留行协议；
-- 静态资产扫描、CMDB 导入、CIDR 发现和持续扫描；
-- 21 项六语言、编译数据库、宏/调用图、静态库、反修饰、ELF/JAR、eBPF 和进程映射扫描矩阵；
-- 10 项扫描到兼容/严格迁移 REST API 工作流矩阵；
-- 14 项 API-first 接入、发布、扫描、资产、迁移、状态、审计和回滚矩阵；
-- 风险评估、SQLite 导入和策略验证；
-- 持久化回退统计；
-- 握手、HTTP、TCP、遗留协议和 MQTT 性能测试。
-
----
-
-## 2. 架构
+## 15. 项目目录
 
 ```text
-资产文件 / CMDB / 批量端点 / 企业 CIDR
-                |
-                v
-+--------------------------------------------+
-| Discovery and Inventory                    |
-| 静态扫描、网段发现、TLS扫描、持续扫描       |
-+--------------------------------------------+
-                |
-                v
-+--------------------------------------------+
-| Risk and Migration Manager                 |
-| 风险评估、SQLite、配置生成、迁移验证         |
-+--------------------------------------------+
-                |
-                v
-客户端 ── TLS 1.3 Hybrid/PQC ──> PQC Gateway
-                                  |
-             +--------------------+--------------------+
-             |                    |                    |
-             v                    v                    v
-        HTTP/HTTPS             MQTT/TCP          遗留协议
-             |
-             v
-    HTTP 或 HTTPS/mTLS 上游系统
-```
-
-默认演示后端只用于验证协议透明性：
-
-- `bank-backend`：普通 HTTP；
-- `secure-backend`：要求客户端证书的 HTTPS；
-- `mqtt-broker`：最小 MQTT 3.1.1 QoS-0 测试 broker；
-- `tcp-backend`：TCP echo；
-- `legacy-backend`：非 HTTP 行协议。
-
-生产接入时应将这些演示后端替换为真实系统地址。
-
----
-
-## 3. 目录结构
-
-```text
-pq-migration-gateway-v3/
-├── backend/                  # HTTP、HTTPS、MQTT、TCP、遗留协议测试后端
-├── certs/                    # 演示 PKI 与上游证书轮换脚本
-├── config/
-│   ├── services.json         # HTTP 与 Stream 服务配置
-│   ├── scan-targets.json     # 批量 TLS 扫描目标
-│   ├── continuous-scan.json  # 持续扫描配置
-│   └── cmdb/                 # CMDB 导入样例
-├── docker/                   # OpenSSL 3.5 + NGINX 构建
-├── gateway/                  # 网关入口脚本
-├── manager/                  # 风险、数据库、策略验证、运行指标
-├── scanner/                  # 静态、批量、CIDR、CMDB、持续扫描
-├── scripts/                  # 构建、实验和性能测试
-├── tests/                    # 离线单元测试
-├── runtime-data/             # 持久日志、指标、扫描快照
-├── docker-compose.yml
+pq-migration-gateway/
+├── backend/                  # 模拟 HTTP/HTTPS/MQTT/TCP/遗留后端
+├── certs/                    # 演示 PKI
+├── config/                   # 服务、扫描和 Enterprise 配置
+├── deploy/enterprise/        # Enterprise Compose
+├── docker/                   # OpenSSL + NGINX 镜像
+├── gateway/                  # 数据面、Agent、适配器和模板
+├── manager/                  # Manager API、数据库、迁移和指标
+├── scanner/                  # 网络、CMDB 和持续扫描
+├── scripts/                  # 初始化、实验、扫描和性能脚本
+├── runtime-data/             # 持久运行数据
+├── experiment-results/       # 普通实验结果
+├── docker-compose.yml        # 普通实验环境
 ├── Makefile
 └── README.md
 ```
 
----
+## 16. WSL 代理构建
 
-## 4. 环境要求
-
-推荐环境：
-
-- WSL2 Ubuntu 24.04；
-- Docker Engine；
-- Docker Compose V2；
-- Python 3；
-- curl、make、unzip。
-
-安装：
-
-```bash
-sudo apt update
-sudo apt install -y ca-certificates curl git make unzip python3 docker.io docker-compose-v2
-sudo usermod -aG docker "$USER"
-newgrp docker
-
-docker version
-docker compose version
-```
-
----
-
-## 5. WSL 代理构建
-
-本项目默认使用 Windows 代理：
+默认代理示例：
 
 ```text
 http://127.0.0.1:7897
 ```
 
-直接执行：
+生成演示证书并构建：
 
 ```bash
 make certs
 make build
 ```
 
-`make build` 实际使用：
+`make build` 应通过 `docker build --network=host`，同时传入大小写两组代理变量：
 
 ```bash
 docker build \
@@ -267,9 +457,36 @@ docker build \
 make build WSL_PROXY=http://127.0.0.1:7890
 ```
 
----
+### 16.1 本机 REST 测试与 NO_PROXY
 
-## 6. 启动项目
+Python `urllib` 可能不识别 `NO_PROXY` 中的 `127.*`。本机 REST 测试应使用精确地址：
+
+```text
+127.0.0.1,localhost
+```
+
+只对一次命令生效：
+
+```bash
+NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}" \
+no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}" \
+python3 scripts/test_scan_migration_api.py \
+  /tmp/pq-scan-migration-debug
+```
+
+为保证测试确定性，进程内 REST 测试也可以在 Python 中禁用代理：
+
+```python
+urllib.request.install_opener(
+    urllib.request.build_opener(
+        urllib.request.ProxyHandler({})
+    )
+)
+```
+
+该设置只影响当前测试进程。
+
+## 17. 普通环境初始化
 
 首次运行：
 
@@ -278,47 +495,29 @@ cd ~/wkspace/pq-migration-gateway
 make init
 ```
 
-`make init` 调用项目根目录的 `init_system.sh`；该入口再执行 `scripts/init_system.sh` 中的完整实现，一次完成：
-
-- 环境与 Docker Compose 检查；
-- `.env` 创建及管理 API/配置签名密钥生成；
-- 运行时目录和演示 PKI 初始化；
-- 统一服务配置校验；
-- 初始签名配置版本发布；
-- OpenSSL 3.5/NGINX 镜像构建；
-- 网关、后端、指标 Agent 和 Manager API 启动；
-- 网关健康状态等待与结果输出。
-
 常用选项：
 
 ```bash
 # 使用已有镜像
 make init INIT_ARGS="--skip-build"
 
-# 只准备环境、证书和初始发布，不要求 Docker
+# 只准备环境、证书和初始发布
 make init INIT_ARGS="--prepare-only"
 
 # 非 WSL 环境无代理构建
 make init INIT_ARGS="--no-proxy"
 ```
 
-脚本默认不会覆盖已有密钥或证书。只有显式传入 `--force-certs` 才会轮换整套演示 PKI。
-
-后续的 `make up` 使用已有证书和镜像，不会重新构建或重新生成 PKI：
+后续启动：
 
 ```bash
-docker compose up -d --no-build --force-recreate
+make up
 ```
 
-检查：
+查看状态和日志：
 
 ```bash
 docker compose ps
-```
-
-查看日志：
-
-```bash
 make logs
 ```
 
@@ -328,102 +527,220 @@ make logs
 make down
 ```
 
-机器重启后通常只需：
+## 18. Enterprise 首次初始化
+
+准备一个真实存在的宿主机扫描目录。测试时可以使用当前项目：
 
 ```bash
 cd ~/wkspace/pq-migration-gateway
-docker compose up -d --no-build
+
+make enterprise-init \
+  SCAN_ROOT="$PWD" \
+  SERVER_NAME=payment-gateway.company.local \
+  LISTEN_PORT=28443
 ```
+
+生产部署示例：
+
+```bash
+make enterprise-init \
+  SCAN_ROOT=/srv/company/apps \
+  SERVER_NAME=payment-gateway.company.local \
+  LISTEN_PORT=28443
+```
+
+`SCAN_ROOT` 是宿主机目录，Docker 将其只读挂载为：
+
+```text
+/workspace/project
+```
+
+`SCAN_ROOT` 只负责授权和挂载，本身不执行扫描。日常扫描通过 `/v1/scans` 创建任务。
+
+## 19. Enterprise 启动和停止
+
+启动：
+
+```bash
+make enterprise-up
+```
+
+检查：
+
+```bash
+make enterprise-status
+make enterprise-capabilities
+```
+
+日志：
+
+```bash
+make enterprise-logs
+```
+
+停止：
+
+```bash
+make enterprise-down
+```
+
+如果需要同时停止可观测组件：
+
+```bash
+docker compose \
+  --env-file .env.enterprise \
+  -f deploy/enterprise/docker-compose.yml \
+  --profile observability \
+  down --remove-orphans
+```
+
+请勿随意添加 `-v`。
+
+## 20. Enterprise 数据持久化
+
+容器可以删除和重建，企业关键数据保存在宿主机：
+
+```text
+runtime-data/enterprise/
+├── control/
+│   ├── control-plane.db
+│   └── scans/
+│       └── <SCAN_ID>/
+│           ├── inventory.json
+│           └── inventory.csv
+├── certs/
+├── config/
+└── metrics/
+```
+
+其他重要文件：
+
+```text
+.env.enterprise
+config/enterprise/services.json
+payment-service.json
+```
+
+普通 `enterprise-down` 后仍会保留：
+
+- Token；
+- 配置签名密钥；
+- 证书；
+- 扫描结果；
+- 资产与风险评估；
+- 发布和回滚历史。
+
+容器内 `/tmp` 候选配置、活动连接和进程状态属于临时数据。
+
+## 21. 主要端口
+
+| 端口 | 用途 |
+|---:|---|
+| `8443` | 普通实验兼容入口 |
+| `9443` | 普通实验严格入口 |
+| `8883` | MQTT TLS |
+| `10443`、`11443` | 客户端 mTLS 实验 |
+| `12443` | 上游 HTTPS/mTLS |
+| `13443`、`14443` | 上游负面实验 |
+| `15443` | TCP TLS |
+| `16443` | 遗留协议 TLS |
+| `18080` | Manager API |
+| `28443` | Enterprise 示例业务入口 |
+| `3000` | Grafana |
+| `9090` | Prometheus |
 
 ---
 
-## 7. 快速验证
+# 第三部分：实验流程
 
-### 7.1 Hybrid/PQC
+## 22. 两套实验的使用原则
 
-```bash
-docker compose exec -T pq-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect localhost:8443 \
-  -servername bank-gateway.local \
-  -tls1_3 \
-  -groups X25519MLKEM768 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief < /dev/null
+```text
+普通实验：停止 Enterprise → run_full_experiment → 清理普通实验
+
+Enterprise：停止普通实验 → enterprise-up → 接入临时/真实后端
 ```
 
-### 7.2 X25519 回退
-
-```bash
-docker compose exec -T pq-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect localhost:8443 \
-  -servername bank-gateway.local \
-  -tls1_3 \
-  -groups X25519 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief < /dev/null
-```
-
-### 7.3 严格模式拒绝 X25519
-
-```bash
-docker compose exec -T pq-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect localhost:9443 \
-  -servername strict-gateway.local \
-  -tls1_3 \
-  -groups X25519 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief < /dev/null
-```
-
-预期出现 TLS handshake failure 或 alert 40。
-
-### 7.4 HTTP 透明代理
-
-```bash
-curl --noproxy '*' \
-  --resolve bank-gateway.local:8443:127.0.0.1 \
-  --cacert certs/ca.crt \
-  https://bank-gateway.local:8443/service-info
-```
+两套环境不需要同时开启。普通完整实验脚本会自行建立模拟后端和测试客户端；Enterprise 需要企业提供真实后端，或者手动建立临时测试后端。
 
 ---
 
-## 8. 一键完整实验
+## 23. 普通完整实验：run_full_experiment
 
-镜像已经构建后：
+### 23.1 停止 Enterprise 和残留实验环境
 
 ```bash
-./scripts/run_full_experiment.sh
+cd ~/wkspace/pq-migration-gateway
+
+docker compose \
+  --env-file .env.enterprise \
+  -f deploy/enterprise/docker-compose.yml \
+  --profile observability \
+  down --remove-orphans
+
+docker compose \
+  -f docker-compose.yml \
+  down --remove-orphans
+
+docker stop pq-manager-api 2>/dev/null || true
 ```
 
-同时维护最新实验指针：
+检查：
 
 ```bash
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
+  | grep -E 'pq-|bank-backend|grafana|prometheus' || true
+```
+
+### 23.2 运行完整实验
+
+镜像已经构建时：
+
+```bash
+NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}" \
+no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}" \
 ./scripts/run_full_experiment.sh --latest
-cat experiment-results/latest/experiment-status.json
-cat experiment-results/latest/SUMMARY.md
 ```
 
 需要重新构建：
 
 ```bash
-BUILD=1 ./scripts/run_full_experiment.sh
+BUILD=1 \
+NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}" \
+no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}" \
+./scripts/run_full_experiment.sh --latest
 ```
 
-`BUILD=1` 同样默认使用 WSL 代理构建，不调用普通 `docker compose build`。
-
-性能配置：
+性能档位：
 
 ```bash
-PERF_PROFILE=quick ./scripts/run_full_experiment.sh
-PERF_PROFILE=standard ./scripts/run_full_experiment.sh
-PERF_PROFILE=stress ./scripts/run_full_experiment.sh
+PERF_PROFILE=quick ./scripts/run_full_experiment.sh --latest
+PERF_PROFILE=standard ./scripts/run_full_experiment.sh --latest
+PERF_PROFILE=stress ./scripts/run_full_experiment.sh --latest
 ```
 
 完整实验默认使用 `standard`。
+
+### 23.3 覆盖范围
+
+完整实验包括：
+
+- 兼容入口 Hybrid 和 X25519；
+- 严格入口接受 Hybrid、拒绝 X25519；
+- 客户端 mTLS 矩阵；
+- 上游 HTTPS、SNI 和网关客户端证书；
+- 错误 CA 和缺少客户端证书负面测试；
+- 上游证书轮换；
+- HTTP、MQTT、TCP 和遗留协议；
+- 企业源码、制品、二进制和进程映射扫描；
+- 扫描到资产到迁移 REST API 工作流；
+- API-first 接入、发布、状态、审计和回滚；
+- CMDB 导入和 CIDR 发现；
+- 在线 TLS 和持续扫描；
+- 回退指标；
+- 端到端性能测试。
+
+### 23.4 成功标志和结果
 
 成功标志：
 
@@ -431,485 +748,531 @@ PERF_PROFILE=stress ./scripts/run_full_experiment.sh
 All v3.6 experiments completed: experiment-results/<UTC时间戳>
 ```
 
-并生成：
-
-```text
-experiment-results/<UTC时间戳>/
-├── experiment-status.json
-├── SUMMARY.md
-├── mtls/mtls-matrix.json
-├── upstream/upstream-tls-matrix.json
-├── stream/stream-protocol-matrix.json
-├── crypto-inventory.json
-├── enterprise-scan/
-│   ├── enterprise-scanner-matrix.json
-│   ├── enterprise-crypto-inventory.json
-│   └── enterprise-crypto-inventory.csv
-├── tls-inventory.json
-├── cmdb-targets.json
-├── network-discovery.json
-├── continuous-scan-latest.json
-├── continuous-scan-diff.json
-├── risk-report.json
-├── inventory.db
-├── migration-verification.json
-├── runtime-fallback-report.json
-├── experiment-fallback-report.json
-└── performance/
-    ├── performance-report.json
-    ├── performance-summary.csv
-    ├── PERFORMANCE.md
-    └── docker-stats.jsonl
-```
-
-检查状态：
-
-```bash
-latest="$(ls -1dt experiment-results/*/ | head -1)"
-cat "$latest/experiment-status.json"
-cat "$latest/SUMMARY.md"
-```
-
-如果运行时使用了 `--latest`，也可以固定查看：
+查看：
 
 ```bash
 cat experiment-results/latest/experiment-status.json
 cat experiment-results/latest/SUMMARY.md
 ```
 
----
+关键结果：
 
-## 9. mTLS 实验矩阵
-
-单独运行：
-
-```bash
-make mtls-test
+```text
+experiment-results/latest/
+├── experiment-status.json
+├── SUMMARY.md
+├── mtls/mtls-matrix.json
+├── upstream/upstream-tls-matrix.json
+├── stream/stream-protocol-matrix.json
+├── enterprise-scan/enterprise-scanner-matrix.json
+├── scan-migration-api/scan-migration-api-matrix.json
+├── api-first/
+├── crypto-inventory.json
+├── tls-inventory.json
+├── network-discovery.json
+├── risk-report.json
+├── inventory.db
+├── migration-verification.json
+└── performance/
 ```
 
-覆盖：
+### 23.5 本机 REST 测试出现空 502
 
-| 测试 | 预期 |
-|---|---|
-| client auth off，无证书 | 成功 |
-| optional，无证书 | 成功 |
-| optional，有效证书 | 成功 |
-| optional，错误 CA 证书 | 拒绝 |
-| required，无证书 | 拒绝 |
-| required，有效证书 | 成功 |
-| required，错误 CA 证书 | 拒绝 |
+若看到：
+
+```text
+POST /v1/scans -> HTTP 502 Bad Gateway; body=''
+```
+
+并且本地 `ApiHandler` 调试函数没有被调用，检查：
+
+```bash
+python3 - <<'PY'
+import urllib.request
+print(urllib.request.getproxies())
+print(urllib.request.proxy_bypass("127.0.0.1"))
+PY
+```
+
+如果输出 `False`，说明 `urllib` 没有识别 `NO_PROXY` 中的 `127.*`。使用精确的 `127.0.0.1`，或者让进程内测试使用 `ProxyHandler({})`。
+
+### 23.6 结束普通实验
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  down --remove-orphans
+
+docker stop pq-manager-api 2>/dev/null || true
+```
 
 ---
 
-## 10. 上游 HTTPS 与 mTLS
+## 24. Enterprise 实验
 
-单独运行：
-
-```bash
-make upstream-test
-```
-
-验证：
-
-- 网关校验上游 CA；
-- 网关发送 `upstream-secure.local` SNI；
-- 网关使用上游客户端证书；
-- 上游强制验证网关客户端证书；
-- 错误 CA 导致 502；
-- 缺少上游客户端证书导致 502；
-- 更换同一 CA 签发的新上游证书后服务恢复正常。
-
----
-
-## 11. MQTT、TCP 与遗留协议
+### 24.1 停止普通实验环境
 
 ```bash
-make stream-test
+cd ~/wkspace/pq-migration-gateway
+
+docker compose \
+  -f docker-compose.yml \
+  down --remove-orphans
+
+docker stop pq-manager-api 2>/dev/null || true
 ```
 
-验证：
+### 24.2 初始化和启动
 
-- MQTT TLS 握手和发布/订阅；
-- 通用 TCP TLS echo；
-- 非 HTTP 行协议的 `PING`、`VERSION` 和 `QUIT`；
-- 三个入口均支持 `X25519MLKEM768`。
+首次初始化：
 
-接入真实系统时，使用统一服务模型：
+```bash
+make enterprise-init \
+  SCAN_ROOT="$PWD" \
+  SERVER_NAME=payment-gateway.company.local \
+  LISTEN_PORT=28443
+```
+
+已经初始化时直接启动：
+
+```bash
+make enterprise-up
+make enterprise-status
+make enterprise-capabilities
+```
+
+### 24.3 建立临时后端
+
+在新的 WSL 终端检查端口：
+
+```bash
+ss -ltnp 'sport = :18082'
+```
+
+如果没有输出，启动：
+
+```bash
+cd /tmp
+python3 -m http.server 18082 --bind 127.0.0.1
+```
+
+保持该终端运行。在项目终端测试：
+
+```bash
+curl -I --connect-timeout 5 \
+  http://127.0.0.1:18082/
+
+docker exec pq-enterprise-gateway \
+  curl -I --connect-timeout 5 \
+  http://127.0.0.1:18082/
+```
+
+预期：
+
+```text
+HTTP/1.0 200 OK
+```
+
+如果 `18082` 被占用，可以使用 `18083`，并同步修改服务配置。
+
+### 24.4 创建完整兼容模式配置
+
+优先从模板复制：
+
+```bash
+cp config/enterprise/service-onboarding.example.json \
+  payment-service.json
+```
+
+将占位上游替换为临时后端：
+
+```bash
+sed -i \
+  's#http://payment.internal:8080#http://127.0.0.1:18082#g' \
+  payment-service.json
+```
+
+完整配置示例：
 
 ```json
 {
-  "id": "database-tls-entry",
-  "adapter": "postgres",
+  "id": "payment-pqc-gateway",
+  "adapter": "http",
   "listen": {
     "address": "0.0.0.0",
-    "port": 25432,
-    "server_name": "database-gateway.local"
+    "port": 28443,
+    "server_name": "payment-gateway.company.local"
   },
   "downstream_tls": {
     "mode": "compatibility",
-    "groups": ["X25519MLKEM768", "X25519"],
-    "client_auth": "required"
+    "groups": [
+      "X25519MLKEM768",
+      "X25519"
+    ],
+    "certificate": "/etc/pq-gateway/certs/server.crt",
+    "private_key": {
+      "provider": "file",
+      "reference": "/etc/pq-gateway/certs/server.key"
+    },
+    "client_auth": "off",
+    "client_ca": "/etc/pq-gateway/certs/ca.crt"
   },
   "upstream": {
-    "address": "postgres.internal:5432",
-    "tls": {"enabled": false, "verify": "off"}
+    "address": "http://127.0.0.1:18082",
+    "tls": {
+      "enabled": false,
+      "verify": "off",
+      "sni": "",
+      "ca": "/etc/ssl/certs/ca-certificates.crt",
+      "client_identity": {
+        "certificate": "",
+        "private_key": {
+          "provider": "file",
+          "reference": ""
+        }
+      }
+    }
+  },
+  "protocol_options": {},
+  "timeouts": {
+    "connect": "5s",
+    "read": "60s",
+    "send": "60s"
+  },
+  "rollout": {
+    "fallback_allowed": true,
+    "hybrid_percentage": 100,
+    "policy": "fixed"
+  },
+  "audit": {
+    "enabled": true
   }
 }
 ```
 
-适用于数据库、消息队列、设备协议和其他 TCP 系统。协议本身仍由后端处理。
-
----
-
-## 11.1 企业源码、可执行程序与运行态扫描
-
-项目目录扫描：
+验证 JSON：
 
 ```bash
-make inventory
+python3 -m json.tool payment-service.json >/dev/null \
+  && echo "JSON 格式正确"
 ```
 
-宿主机部署路径和运行进程扫描（仅对已授权主机执行）：
+### 24.5 发布兼容模式
 
 ```bash
-make enterprise-inventory
+make enterprise-api-onboard \
+  SERVICE_FILE=payment-service.json
+
+sleep 5
+
+make enterprise-history
+make enterprise-status
 ```
 
-输出 `enterprise-crypto-inventory.json` 和 `.csv`，包含源码接口方法、
-ELF/PE/JAR 制品、动态依赖、导入符号、SHA-256、证据置信度及进程映射。
-扫描器按文件魔数识别二进制，不执行目标程序，也不保存私钥内容。
-
-单独运行 21 项确定性实验：
-
-```bash
-make enterprise-scan-test
-cat experiment-results/manual-enterprise-scan/enterprise-scanner-matrix.json
-```
-
-详细说明见 `docs/enterprise-scanning.md`。
-
----
-
-## 12. 批量端点和 CMDB 导入
-
-### 12.1 批量目标
-
-编辑：
+成功条件：
 
 ```text
-config/scan-targets.json
+latest_release.status = HEALTHY
+current_version = desired_version
+agent.status = HEALTHY
 ```
 
-格式：
+### 24.6 验证兼容模式
+
+Hybrid：
+
+```bash
+docker exec -i pq-enterprise-gateway \
+  /opt/openssl/bin/openssl s_client \
+  -connect 127.0.0.1:28443 \
+  -servername payment-gateway.company.local \
+  -tls1_3 \
+  -groups X25519MLKEM768 \
+  -CAfile /etc/pq-gateway/certs/ca.crt \
+  -brief </dev/null
+```
+
+经典 X25519：
+
+```bash
+docker exec -i pq-enterprise-gateway \
+  /opt/openssl/bin/openssl s_client \
+  -connect 127.0.0.1:28443 \
+  -servername payment-gateway.company.local \
+  -tls1_3 \
+  -groups X25519 \
+  -CAfile /etc/pq-gateway/certs/ca.crt \
+  -brief </dev/null
+```
+
+兼容模式下两条命令都应成功。
+
+完整 Hybrid 业务转发：
+
+```bash
+printf 'GET / HTTP/1.1\r\nHost: payment-gateway.company.local\r\nConnection: close\r\n\r\n' \
+  | docker exec -i pq-enterprise-gateway \
+      /opt/openssl/bin/openssl s_client \
+      -connect 127.0.0.1:28443 \
+      -servername payment-gateway.company.local \
+      -tls1_3 \
+      -groups X25519MLKEM768 \
+      -CAfile /etc/pq-gateway/certs/ca.crt \
+      -quiet
+```
+
+预期收到 Python 临时后端的 `HTTP/1.0 200 OK`。
+
+### 24.7 扫描密码资产
+
+日常调用不需要再次传入宿主机 `SCAN_ROOT`：
+
+```bash
+make enterprise-scan
+```
+
+创建并等待完成：
+
+```bash
+set -a
+source .env.enterprise
+set +a
+
+python3 manager/pqapi.py scan create \
+  --root /workspace/project \
+  --wait
+```
+
+查询：
+
+```bash
+python3 manager/pqapi.py scan list
+python3 manager/pqapi.py scan get SCAN_ID
+python3 manager/pqapi.py scan findings SCAN_ID
+
+make enterprise-assets
+python3 manager/pqapi.py asset list
+python3 manager/pqapi.py asset get ASSET_ID
+```
+
+风险评估：
+
+```bash
+python3 manager/pqapi.py asset assess ASSET_ID
+```
+
+### 24.8 发布严格模式
+
+先记录当前兼容版本：
+
+```bash
+make enterprise-history
+```
+
+修改 `payment-service.json`：
 
 ```json
-{
-  "targets": [
-    {
-      "asset_id": "api-001",
-      "host": "10.10.1.20",
-      "port": 443,
-      "sni": "api.internal",
-      "protocol": "https",
-      "owner": "api-team",
-      "environment": "production",
-      "criticality": "high"
-    }
+"downstream_tls": {
+  "mode": "strict",
+  "groups": [
+    "X25519MLKEM768"
   ]
 }
 ```
 
-### 12.2 CMDB 导入
+保留 `certificate`、`private_key`、`client_auth` 和 `client_ca` 字段。
 
-```bash
-PYTHONPATH=scanner python3 scanner/cmdb_import.py \
-  --input config/cmdb/sample-assets.csv \
-  --out-json cmdb-targets.json \
-  --out-csv cmdb-targets.csv
+同时修改：
+
+```json
+"rollout": {
+  "fallback_allowed": false,
+  "hybrid_percentage": 100,
+  "policy": "fixed"
+}
 ```
 
-支持 CSV 和 JSON，可重复提供 `--input`。
-
----
-
-## 13. CIDR 网段发现
-
-只扫描明确授权的企业网段：
+发布：
 
 ```bash
-PYTHONPATH=scanner python3 scanner/network_discovery.py \
-  --cidr 10.10.0.0/24 \
-  --cidr 10.20.0.0/24 \
-  --ports 443,8443,8883,9443 \
-  --max-hosts 1024 \
-  --workers 64 \
-  --timeout 1.5 \
-  --out-json discovered-endpoints.json \
-  --out-csv discovered-endpoints.csv
+make enterprise-api-onboard \
+  SERVICE_FILE=payment-service.json
+
+sleep 5
+
+make enterprise-history
+make enterprise-status
 ```
 
-`--max-hosts` 防止误展开过大的网段。
+### 24.9 验证严格模式
 
----
-
-## 14. 在线 TLS 扫描
-
-网关容器内使用 OpenSSL 3.5：
+Hybrid 应成功：
 
 ```bash
-make tls-scan
+docker exec -i pq-enterprise-gateway \
+  /opt/openssl/bin/openssl s_client \
+  -connect 127.0.0.1:28443 \
+  -servername payment-gateway.company.local \
+  -tls1_3 \
+  -groups X25519MLKEM768 \
+  -CAfile /etc/pq-gateway/certs/ca.crt \
+  -brief </dev/null
 ```
 
-批量调用：
+经典 X25519 应失败：
 
 ```bash
-docker compose exec -T pq-gateway \
-  python3 /workspace/scanner/tls_scanner.py \
-  --targets-file /etc/pq-gateway/config/scan-targets.json \
-  --groups X25519MLKEM768:X25519 \
-  --openssl /opt/openssl/bin/openssl \
-  --cafile /etc/pq-gateway/certs/ca.crt \
-  --workers 16 \
-  --allow-unreachable \
-  --out-json /tmp/tls-inventory.json \
-  --out-csv /tmp/tls-inventory.csv
+docker exec -i pq-enterprise-gateway \
+  /opt/openssl/bin/openssl s_client \
+  -connect 127.0.0.1:28443 \
+  -servername payment-gateway.company.local \
+  -tls1_3 \
+  -groups X25519 \
+  -CAfile /etc/pq-gateway/certs/ca.crt \
+  -brief </dev/null
 ```
 
-扫描器也支持：
+还需要验证 Hybrid 业务请求能够到达后端。`HEALTHY` 说明配置已加载和基础健康检查通过，不等于所有真实业务客户端已经验证完成。
+
+### 24.10 回滚兼容版本
+
+```bash
+make enterprise-history
+```
+
+假设之前的兼容版本为 `5`：
+
+```bash
+make enterprise-rollback VERSION=5
+
+sleep 5
+
+make enterprise-history
+make enterprise-status
+```
+
+实际操作必须使用当前历史中正确的兼容版本号。
+
+### 24.11 可观测组件
+
+```bash
+make dashboard-up
+```
+
+访问：
 
 ```text
---endpoint HOST:PORT,SNI,PROTOCOL
---targets-file targets.json
---cmdb-file cmdb.csv
---discovery-file discovered.json
+Grafana:    http://127.0.0.1:3000
+Prometheus: http://127.0.0.1:9090
+OpenAPI:    http://127.0.0.1:18080/openapi.json
 ```
+
+### 24.12 结束 Enterprise 实验
+
+先在临时 Python 后端终端按 `Ctrl+C`。
+
+停止 Enterprise：
+
+```bash
+docker compose \
+  --env-file .env.enterprise \
+  -f deploy/enterprise/docker-compose.yml \
+  --profile observability \
+  down --remove-orphans
+```
+
+企业数据库、证书、Token、扫描结果和发布历史仍保存在 `runtime-data/enterprise/`。
 
 ---
 
-## 15. 定时持续扫描
+## 25. 常见故障
 
-启动扫描调度器：
+### 25.1 Manager API 返回 401
 
-```bash
-make continuous-scan
-```
-
-等价于：
+普通实验和 Enterprise Manager API 同时占用 `18080`。停止旧实验 API：
 
 ```bash
-docker compose --profile continuous-scan up -d scanner-scheduler
+docker stop pq-manager-api 2>/dev/null || true
+make enterprise-up
+make enterprise-capabilities
 ```
 
-配置：
+### 25.2 `payment-service.json` 不存在
+
+```bash
+cp config/enterprise/service-onboarding.example.json \
+  payment-service.json
+```
+
+### 25.3 `payment.internal` 无法解析
+
+`payment.internal` 是模板占位符。替换为真实或临时后端：
+
+```json
+"address": "http://127.0.0.1:18082"
+```
+
+### 25.4 临时后端端口被占用
+
+```bash
+ss -ltnp 'sport = :18082'
+curl -I http://127.0.0.1:18082/
+```
+
+如果已有服务不可用，改用 `18083`。
+
+### 25.5 新配置失败但 Gateway 仍为 HEALTHY
+
+如果：
 
 ```text
-config/continuous-scan.json
+latest_release.status = NGINX_TEST_FAILED
+agent.current_version = 旧版本
+agent.status = HEALTHY
 ```
 
-结果：
+说明候选配置检查失败，旧健康版本仍在运行。修复上游地址或配置后重新发布，不需要删除数据库。
 
-```text
-runtime-data/scans/
-├── latest.json
-└── <时间戳>/
-    ├── tls-inventory.json
-    ├── tls-inventory.csv
-    └── diff.json
+### 25.6 扫描 API 返回空 502
+
+检查 Python 是否将本机请求交给代理：
+
+```bash
+python3 - <<'PY'
+import urllib.request
+print(urllib.request.proxy_bypass("127.0.0.1"))
+PY
 ```
 
-`diff.json` 标记新增、删除和能力变化，例如：
-
-- 新证书；
-- PQC group 被移除；
-- X25519 fallback 被重新启用；
-- 端点不可达；
-- 证书指纹变化。
+需要返回 `True`。`127.*` 在部分 Python 环境中不能匹配 `127.0.0.1`。
 
 ---
 
-## 16. 持久化回退指标
+## 26. 最简命令索引
 
-查看：
-
-```bash
-make metrics
-```
-
-或：
+普通完整实验：
 
 ```bash
-cat runtime-data/metrics/current.json
-cat runtime-data/metrics/pqc_gateway.prom
+make down
+make enterprise-down
+./scripts/run_full_experiment.sh --latest
 ```
 
-重新生成：
+Enterprise：
 
 ```bash
-python3 manager/fallback_report.py \
-  --log runtime-data/logs/access.log \
-  --log runtime-data/logs/stream-access.log \
-  --out runtime-fallback-report.json
+make enterprise-up
+make enterprise-status
+make enterprise-capabilities
+make enterprise-scan
+make enterprise-assets
+make enterprise-api-onboard SERVICE_FILE=payment-service.json
+make enterprise-history
+make dashboard-up
 ```
 
-最近 24 小时：
+停止 Enterprise：
 
 ```bash
-python3 manager/fallback_report.py \
-  --log runtime-data/logs/access.log \
-  --log runtime-data/logs/stream-access.log \
-  --since-hours 24 \
-  --out fallback-last-24h.json
+make enterprise-down
 ```
-
----
-
-## 17. 完整性能测试
-
-```bash
-make performance
-```
-
-或：
-
-```bash
-PERF_PROFILE=standard \
-  ./scripts/run_performance_suite.sh experiment-results/performance-manual
-```
-
-测试内容：
-
-- Hybrid 与 X25519 握手延迟；
-- 严格 Hybrid 握手；
-- HTTP Hybrid 与 X25519 往返延迟；
-- TCP Hybrid 与 X25519 往返延迟；
-- 遗留协议 Hybrid 往返；
-- MQTT 在 `X25519MLKEM768` 与 `X25519` 下的 QoS-0 往返延迟和吞吐量；
-- 兼容 MQTT 客户端的批量发布/订阅基线；
-- 多并发成功率；
-- P50、P95、P99；
-- 每秒操作数；
-- 网关与后端容器 CPU、内存采样。
-
-配置：
-
-| Profile | 说明 |
-|---|---|
-| `quick` | 快速回归 |
-| `standard` | 默认完整实验 |
-| `stress` | 较高连接量与并发 |
-
-这些结果属于端到端工程测试，包含进程启动、容器调度和网络开销，不等同于纯密码算法 micro-benchmark。
-
----
-
-## 18. SQLite 查看
-
-```bash
-sudo apt install -y sqlite3
-latest="$(ls -1dt experiment-results/*/ | head -1)"
-sqlite3 "$latest/inventory.db" ".tables"
-```
-
-查看资产：
-
-```bash
-sqlite3 -header -column "$latest/inventory.db" \
-  "SELECT asset_id,asset_type,algorithm,key_bits,risk,path FROM assets;"
-```
-
-查看端点：
-
-```bash
-sqlite3 -header -column "$latest/inventory.db" \
-  "SELECT name,host,port,sni,application_protocol,pqc_supported,fallback_enabled,owner,environment FROM endpoints;"
-```
-
-查看 CMDB：
-
-```bash
-sqlite3 -header -column "$latest/inventory.db" \
-  "SELECT asset_id,name,host,port,protocol,owner,environment,criticality FROM cmdb_assets;"
-```
-
----
-
-## 19. 添加新服务
-
-HTTP/HTTPS：
-
-```bash
-python3 manager/generate_service_config.py \
-  --id legacy-api \
-  --adapter http \
-  --listen 17443 \
-  --server-name legacy-api.local \
-  --upstream https://legacy-api.internal:443 \
-  --upstream-tls-verify required \
-  --upstream-sni legacy-api.internal \
-  --mode compatibility
-```
-
-TCP/消息队列/遗留协议：
-
-```bash
-python3 manager/generate_service_config.py \
-  --id kafka-entry \
-  --adapter kafka \
-  --listen 19093 \
-  --server-name kafka-gateway.local \
-  --upstream kafka.internal:9092 \
-  --mode compatibility
-```
-
-验证并创建不可变发布版本：
-
-```bash
-make validate-config
-make config-apply
-make config-history
-```
-
-网关代理检测到期望版本后会依次执行静态校验、`nginx -t`、原子替换、reload 和健康检查；失败时恢复上一个活动配置。
-
-回滚会基于历史版本创建一个新的、可审计的发布版本，而不会修改历史记录：
-
-```bash
-make config-rollback VERSION=1
-```
-
-控制面 API：
-
-```bash
-export MANAGER_API_TOKEN='replace-with-a-random-secret'
-make control-plane
-curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/configs
-curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/scans
-curl -H "Authorization: Bearer $MANAGER_API_TOKEN" http://127.0.0.1:18080/v1/assets
-curl http://127.0.0.1:18080/metrics
-
-python3 manager/pqctl.py service list
-python3 manager/pqctl.py agent list
-python3 manager/pqctl.py metrics prometheus
-```
-
-扫描任务使用 `/v1/scans`，资产、评估和迁移编排使用 `/v1/assets`。完整说明见
-`docs/service-model.md`、`docs/control-plane.md` 和 `docs/scan-migration-api.md`。
-
----
-
-## 20. 项目边界
-
-v3.6 已提供单节点 API-first 企业部署、控制面运行时、安全发布闭环、持续仪表盘、企业密码资产发现及扫描到迁移编排，但仍是企业试点框架，不是完整集群产品。生产化仍需：
-
-- 银行或企业 PKI；
-- HSM/KMS；
-- 密钥轮换与吊销；
-- 高可用与负载均衡；
-- 多节点配置共识与滚动发布；
-- WAF、DDoS、限流；
-- SIEM 和审计留存；
-- 大规模 CMDB/证书平台集成；
-- 经授权的生产网段扫描策略；
-- 针对实际数据库、Kafka、RabbitMQ、MQTT 和专有协议的兼容性测试。
-
-项目不会解析或实现具体金融业务，也不会替代应用层报文签名迁移。
