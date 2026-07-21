@@ -55,7 +55,21 @@ class ExecutableAndRuntimeTests(unittest.TestCase):
             )
             matrix = json.loads((output / "enterprise-scanner-matrix.json").read_text(encoding="utf-8"))
             inventory = json.loads((output / "enterprise-crypto-inventory.json").read_text(encoding="utf-8"))
-            self.assertEqual(matrix["summary"], {"tests": 23, "passed": 23, "failed": 0})
+            semantic_tests = {
+                "cpp_clang_template",
+                "cpp_clang_function_pointer",
+                "cpp_clang_virtual_dispatch",
+            }
+            expected_tests = 23 + (len(semantic_tests) if matrix["cpp_semantic_available"] else 0)
+            self.assertEqual(
+                matrix["summary"],
+                {"tests": expected_tests, "passed": expected_tests, "failed": 0},
+            )
+            result_names = {row["test"] for row in matrix["results"]}
+            if matrix["cpp_semantic_available"]:
+                self.assertTrue(semantic_tests.issubset(result_names))
+            else:
+                self.assertTrue(semantic_tests.isdisjoint(result_names))
             self.assertEqual(inventory["schema_version"], 4)
             self.assertEqual(inventory["scanner_version"], "3.7.0")
             self.assertGreaterEqual(inventory["summary"]["native_executables"], 3)
