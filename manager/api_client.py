@@ -1,6 +1,7 @@
 """Dependency-free Python client for the PQ Gateway Manager REST API."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 import urllib.error
@@ -25,6 +26,18 @@ class ManagerApiClient:
             raise ValueError("Manager API URL must start with http:// or https://")
         if not token:
             raise ValueError("Manager API bearer token is required")
+        hostname = (urllib.parse.urlsplit(self.base_url).hostname or "").lower()
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = hostname == "localhost"
+        self.proxy_disabled = loopback
+        # Local control-plane traffic must never be sent to an HTTP proxy.  In
+        # particular, urllib does not interpret common entries such as `127.*`
+        # in NO_PROXY consistently.  Remote Manager API URLs retain the normal
+        # environment-proxy behavior.
+        handlers = [urllib.request.ProxyHandler({})] if self.proxy_disabled else []
+        self.opener = urllib.request.build_opener(*handlers)
 
     def request(self, method: str, path: str, payload: dict | None = None) -> object:
         data = json.dumps(payload).encode() if payload is not None else None
@@ -40,7 +53,7 @@ class ManagerApiClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 content = response.read()
                 return json.loads(content) if content else {}
         except urllib.error.HTTPError as exc:
@@ -70,6 +83,9 @@ class ManagerApiClient:
         if compile_commands:
             payload["compile_commands"] = compile_commands
         return self.request("POST", "/v1/scans", payload)  # type: ignore[return-value]
+
+    def submit_runtime_report(self, report: dict) -> dict:
+        return self.request("POST", "/v1/runtime/reports", report)  # type: ignore[return-value]
 
     def wait_scan(self, scan_id: str, timeout: float = 300, interval: float = 1) -> dict:
         deadline = time.monotonic() + timeout

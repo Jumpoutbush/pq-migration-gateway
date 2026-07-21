@@ -1,0 +1,14 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 ca-certificates binutils bpftrace \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/pq-runtime-agent/manager /opt/pq-runtime-agent/scanner /var/lib/pq-runtime-agent/spool
+
+COPY manager /opt/pq-runtime-agent/manager
+COPY scanner /opt/pq-runtime-agent/scanner
+
+ENV PYTHONPATH=/opt/pq-runtime-agent
+ENTRYPOINT ["python3", "/opt/pq-runtime-agent/manager/runtime_agent.py"]
+CMD ["watch", "--proc-root", "/host/proc", "--spool-dir", "/var/lib/pq-runtime-agent/spool"]

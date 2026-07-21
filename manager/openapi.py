@@ -1,4 +1,4 @@
-"""OpenAPI contract for the v3.6 API-first control plane."""
+"""OpenAPI contract for the v3.7 API-first control plane."""
 from __future__ import annotations
 
 
@@ -77,6 +77,23 @@ def document(server_url: str = "http://127.0.0.1:18080") -> dict:
             "parameters": [{"name": "scan_id", "in": "path", "required": True, "schema": {"type": "string"}}],
             "get": _operation("List scan findings and interface evidence"),
         },
+        "/v1/runtime/reports": {
+            "post": _operation(
+                "Submit an idempotent process/container runtime evidence batch",
+                body_schema={"$ref": "#/components/schemas/RuntimeReport"}, success="202",
+            ),
+        },
+        "/v1/runtime/agents": {"get": _operation("List Runtime Agents and freshness")},
+        "/v1/runtime/agents/{agent_id}": {
+            "parameters": [{"name": "agent_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+            "get": _operation("Get one Runtime Agent and its observed processes"),
+        },
+        "/v1/runtime/batches": {"get": _operation("List Runtime Agent ingestion batches")},
+        "/v1/runtime/batches/{batch_id}": {
+            "parameters": [{"name": "batch_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+            "get": _operation("Get one Runtime Agent ingestion batch"),
+        },
+        "/v1/runtime/observations": {"get": _operation("List normalized runtime library and crypto-call observations")},
         "/v1/assets": {"get": _operation("List normalized cryptographic assets")},
         "/v1/assets/{asset_id}": {
             "parameters": [{"name": "asset_id", "in": "path", "required": True, "schema": {"type": "string"}}],
@@ -129,7 +146,7 @@ def document(server_url: str = "http://127.0.0.1:18080") -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "PQC Migration Gateway Manager API",
-            "version": "3.6.0",
+            "version": "3.7.0",
             "description": "API-first enterprise cryptographic discovery, migration release and rollback control plane.",
         },
         "servers": [{"url": server_url}],
@@ -190,9 +207,31 @@ def document(server_url: str = "http://127.0.0.1:18080") -> dict:
                         "type": {"type": "string", "enum": ["enterprise"], "default": "enterprise"},
                         "roots": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                         "compile_commands": {"type": "array", "items": {"type": "string"}},
+                        "cpp_semantic": {"type": "string", "enum": ["auto", "on", "off"], "default": "auto"},
                         "scan_processes": {"type": "boolean", "default": False},
                         "ebpf_trace": {"type": "string"},
                         "live_ebpf": {"type": "boolean", "default": False},
+                    },
+                },
+                "RuntimeReport": {
+                    "type": "object",
+                    "required": ["schema_version", "batch_id", "collected_at", "agent", "processes", "observations"],
+                    "properties": {
+                        "schema_version": {"type": "integer", "enum": [1]},
+                        "batch_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
+                        "collected_at": {"type": "string"},
+                        "agent": {
+                            "type": "object", "required": ["id", "hostname", "version"],
+                            "properties": {
+                                "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
+                                "hostname": {"type": "string"}, "version": {"type": "string"},
+                                "boot_id": {"type": "string"}, "mode": {"type": "string"},
+                                "capabilities": {"type": "array", "items": {"type": "string"}},
+                                "metadata": {"type": "object"},
+                            },
+                        },
+                        "processes": {"type": "array", "maxItems": 5000, "items": {"type": "object"}},
+                        "observations": {"type": "array", "maxItems": 20000, "items": {"type": "object"}},
                     },
                 },
                 "MigrationRequest": {

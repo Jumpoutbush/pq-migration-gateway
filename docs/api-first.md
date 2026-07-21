@@ -1,4 +1,4 @@
-# API-First Customer Integration (v3.6)
+# API-First Customer Integration (v3.7)
 
 The shell experiment is an acceptance harness. It is not the customer control
 interface. After the enterprise containers have started, customer platforms,

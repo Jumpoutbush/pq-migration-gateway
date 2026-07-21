@@ -29,7 +29,8 @@ curl -X POST \
   -d '{
     "type":"enterprise",
     "roots":["/workspace/project/app"],
-    "compile_commands":["/workspace/project/app/build/compile_commands.json"]
+    "compile_commands":["/workspace/project/app/build/compile_commands.json"],
+    "cpp_semantic":"auto"
   }' \
   http://127.0.0.1:18080/v1/scans
 ```

@@ -1,14 +1,17 @@
 SHELL := /usr/bin/env bash
-IMAGE := pq-migration-gateway-pq-gateway:3.6
+IMAGE := pq-migration-gateway-pq-gateway:3.7
 WSL_PROXY ?= http://127.0.0.1:7897
 INIT_ARGS ?=
 ENTERPRISE_COMPOSE := deploy/enterprise/docker-compose.yml
 ENTERPRISE_ENV := .env.enterprise
+RUNTIME_AGENT_COMPOSE := deploy/runtime-agent/docker-compose.yml
+RUNTIME_AGENT_EBPF_COMPOSE := deploy/runtime-agent/docker-compose.ebpf.yml
+RUNTIME_AGENT_IMAGE := pq-migration-runtime-agent:3.7
 SCAN_ROOT ?= $(CURDIR)
 SERVER_NAME ?= pqc-gateway.local
 LISTEN_PORT ?= 8443
 
-.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test unit-test mtls-test upstream-test stream-test inventory enterprise-inventory enterprise-scan-test scan-migration-api-test api-first-test cmdb-import discover tls-scan continuous-scan metrics performance experiment enterprise-init enterprise-onboard enterprise-api-onboard enterprise-capabilities enterprise-validate enterprise-apply enterprise-history enterprise-rollback enterprise-up enterprise-down enterprise-status enterprise-logs enterprise-scan enterprise-assets enterprise-audit dashboard-up dashboard-down clean zip
+.PHONY: init certs validate-config config-apply config-history config-rollback control-plane agents control-metrics build up down logs test unit-test mtls-test upstream-test stream-test inventory enterprise-inventory enterprise-scan-test scan-migration-api-test runtime-agent-workflow-test api-first-test cmdb-import discover tls-scan continuous-scan metrics performance experiment enterprise-init enterprise-onboard enterprise-api-onboard enterprise-capabilities enterprise-validate enterprise-apply enterprise-history enterprise-rollback enterprise-up enterprise-down enterprise-status enterprise-logs enterprise-scan enterprise-assets enterprise-audit runtime-agent-build runtime-agent-up runtime-agent-ebpf-up runtime-agent-down runtime-agent-status runtime-agent-logs runtime-agent-once runtime-agents runtime-observations dashboard-up dashboard-down clean zip
 
 init:
 	./init_system.sh $(INIT_ARGS)
@@ -47,7 +50,7 @@ enterprise-rollback:
 enterprise-up: enterprise-validate
 	@docker image inspect $(IMAGE) >/dev/null 2>&1 || (echo "enterprise image is missing; run 'make build' first" >&2; exit 2)
 	set -a;source $(ENTERPRISE_ENV);set +a;docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) up -d gateway manager-api metrics-agent
-	@for attempt in $$(seq 1 60);do curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break;sleep 1;done;curl -fsS http://127.0.0.1:18080/healthz >/dev/null
+	@for attempt in $$(seq 1 60);do curl --noproxy '*' -fsS http://127.0.0.1:18080/healthz >/dev/null && break;sleep 1;done;curl --noproxy '*' -fsS http://127.0.0.1:18080/healthz >/dev/null
 	@if [[ ! -s runtime-data/enterprise/control/desired.json ]];then \
 	  set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py release publish --file config/enterprise/services.json; \
 	fi
@@ -76,6 +79,50 @@ enterprise-assets:
 enterprise-audit:
 	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
 	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py audit
+
+runtime-agent-build:
+	docker build \
+	  --network=host \
+	  --build-arg HTTP_PROXY=$(WSL_PROXY) \
+	  --build-arg HTTPS_PROXY=$(WSL_PROXY) \
+	  --build-arg http_proxy=$(WSL_PROXY) \
+	  --build-arg https_proxy=$(WSL_PROXY) \
+	  --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
+	  --build-arg no_proxy=localhost,127.0.0.1,::1 \
+	  -f docker/Dockerfile.runtime-agent \
+	  -t $(RUNTIME_AGENT_IMAGE) .
+
+runtime-agent-up:
+	@test -s $(ENTERPRISE_ENV) || (echo "run 'make enterprise-init' first" >&2; exit 2)
+	@docker image inspect $(RUNTIME_AGENT_IMAGE) >/dev/null 2>&1 || (echo "runtime-agent image is missing; run 'make runtime-agent-build' first" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(RUNTIME_AGENT_COMPOSE) up -d --no-build
+
+runtime-agent-ebpf-up:
+	@test -s $(ENTERPRISE_ENV) || (echo "run 'make enterprise-init' first" >&2; exit 2)
+	@docker image inspect $(RUNTIME_AGENT_IMAGE) >/dev/null 2>&1 || (echo "runtime-agent image is missing; run 'make runtime-agent-build' first" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(RUNTIME_AGENT_COMPOSE) -f $(RUNTIME_AGENT_EBPF_COMPOSE) up -d --no-build
+
+runtime-agent-down:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(RUNTIME_AGENT_COMPOSE) down
+
+runtime-agent-status:
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(RUNTIME_AGENT_COMPOSE) ps
+
+runtime-agent-logs:
+	docker compose --env-file $(ENTERPRISE_ENV) -f $(RUNTIME_AGENT_COMPOSE) logs -f runtime-agent
+
+runtime-agent-once:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/runtime_agent.py once --spool-dir runtime-data/enterprise/runtime-agent/spool
+
+runtime-agents:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py runtime agents
+
+runtime-observations:
+	@test -s $(ENTERPRISE_ENV) || (echo "$(ENTERPRISE_ENV) is missing" >&2; exit 2)
+	set -a;source $(ENTERPRISE_ENV);set +a;python3 manager/pqapi.py runtime observations
 
 dashboard-up: enterprise-up
 	docker compose --env-file $(ENTERPRISE_ENV) -f $(ENTERPRISE_COMPOSE) --profile observability up -d prometheus grafana
@@ -168,6 +215,9 @@ enterprise-scan-test:
 scan-migration-api-test:
 	python3 scripts/test_scan_migration_api.py experiment-results/manual-scan-migration-api
 
+runtime-agent-workflow-test:
+	python3 scripts/test_runtime_agent_workflow.py experiment-results/manual-runtime-agent
+
 api-first-test:
 	python3 scripts/test_api_first_workflow.py experiment-results/manual-api-first
 
@@ -207,7 +257,7 @@ clean:
 	touch runtime-data/logs/.gitkeep runtime-data/metrics/.gitkeep runtime-data/scans/.gitkeep runtime-data/control/.gitkeep
 
 zip:
-	cd .. && zip -r pq-migration-gateway-v3.6.0.zip pq-migration-gateway-v3 \
+	cd .. && zip -r pq-migration-gateway-v3.7.0.zip pq-migration-gateway-v3 \
 	  -x '*/.git/*' '*/experiment-results/*' '*/runtime-data/logs/*.log' \
 	     '*/runtime-data/metrics/*' '*/runtime-data/scans/*' '*/runtime-data/control/*' \
 	     '*/certs/*.key' '*/certs/*.crt' '*/certs/*.csr' '*/certs/*.srl' \

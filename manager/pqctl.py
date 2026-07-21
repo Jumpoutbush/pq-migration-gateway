@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline bootstrap CLI for v3.6; use pqapi for day-2 REST operations."""
+"""Offline bootstrap CLI for v3.7; use pqapi for day-2 REST operations."""
 from __future__ import annotations
 
 import argparse

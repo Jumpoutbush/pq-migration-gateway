@@ -1,0 +1,39 @@
+name: pq-migration-runtime-agent
+
+services:
+  runtime-agent:
+    image: "${PQ_RUNTIME_AGENT_IMAGE:-pq-migration-runtime-agent:3.7}"
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.runtime-agent
+    container_name: pq-enterprise-runtime-agent
+    pid: host
+    network_mode: host
+    user: "0:0"
+    environment:
+      PQ_MANAGER_API_URL: "${PQ_MANAGER_API_URL:-http://127.0.0.1:18080}"
+      RUNTIME_AGENT_TOKEN: "${RUNTIME_AGENT_TOKEN:?set by make enterprise-init}"
+      PQ_RUNTIME_AGENT_ID: "${PQ_RUNTIME_AGENT_ID:-enterprise-runtime-agent-1}"
+      PQ_RUNTIME_PROC_ROOT: /host/proc
+      PQ_RUNTIME_SPOOL_DIR: /var/lib/pq-runtime-agent/spool
+      PQ_RUNTIME_EBPF: "0"
+    command:
+      - watch
+      - --proc-root
+      - /host/proc
+      - --spool-dir
+      - /var/lib/pq-runtime-agent/spool
+      - --interval
+      - "${PQ_RUNTIME_AGENT_INTERVAL:-30}"
+    volumes:
+      - /proc:/host/proc:ro
+      - ../../runtime-data/enterprise/runtime-agent:/var/lib/pq-runtime-agent
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    # The bind-mounted spool is owned by the invoking host user. The Agent
+    # runs as UID 0 for host process/eBPF inspection, so it needs an explicit
+    # write override after cap_drop removes all default capabilities.
+    cap_add: ["SYS_PTRACE", "DAC_READ_SEARCH", "DAC_OVERRIDE"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

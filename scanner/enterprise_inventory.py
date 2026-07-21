@@ -17,6 +17,8 @@ import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from scanner.cpp_semantic import analyze_cpp_source
+
 
 SOURCE_LANGUAGES = {
     ".c": "c", ".h": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
@@ -75,6 +77,7 @@ def _compile_context(entry: dict, database: Path) -> tuple[str, dict] | None:
     tokens = _compile_tokens(entry)
     includes: list[str] = []
     definitions: dict[str, str] = {}
+    semantic_arguments: list[str] = []
     standard = ""
     index = 1
     while index < len(tokens):
@@ -92,6 +95,8 @@ def _compile_context(entry: dict, database: Path) -> tuple[str, dict] | None:
             if not include.is_absolute():
                 include = (directory / include).resolve()
             includes.append(str(include))
+            include_flag = token if token in {"-I", "-isystem", "-iquote"} else "-isystem" if token.startswith("-isystem") else "-I"
+            semantic_arguments.extend([include_flag, str(include)])
         definition = ""
         if token == "-D" and index + 1 < len(tokens):
             definition = tokens[index + 1]
@@ -101,9 +106,22 @@ def _compile_context(entry: dict, database: Path) -> tuple[str, dict] | None:
         if definition:
             name, _, macro_value = definition.partition("=")
             if re.fullmatch(r"[A-Za-z_]\w*", name):
-                definitions[name] = "<redacted>" if re.search(r"(?:PASS|TOKEN|SECRET|API_?KEY|CREDENTIAL)", name, re.I) else (macro_value or "1")
+                sensitive = bool(re.search(r"(?:PASS|TOKEN|SECRET|API_?KEY|CREDENTIAL)", name, re.I))
+                definitions[name] = "<redacted>" if sensitive else (macro_value or "1")
+                if not sensitive:
+                    semantic_arguments.append(f"-D{name}={macro_value}" if macro_value else f"-D{name}")
         if token.startswith("-std="):
             standard = token.split("=", 1)[1]
+            semantic_arguments.append(token)
+        elif token in {"-nostdinc", "-nostdinc++", "-pthread", "-fms-extensions", "-fms-compatibility", "-fdelayed-template-parsing"}:
+            semantic_arguments.append(token)
+        elif token.startswith(("--target=", "--sysroot=", "-march=", "-mcpu=", "-mfpu=", "-mabi=")) or token in {"-m32", "-m64"}:
+            semantic_arguments.append(token)
+        elif token in {"-target", "-isysroot", "-U"} and index + 1 < len(tokens):
+            semantic_arguments.extend([token, tokens[index + 1]])
+            index += 1
+        elif token.startswith("-U") and len(token) > 2 and re.fullmatch(r"[A-Za-z_]\w*", token[2:]):
+            semantic_arguments.append(token)
         index += 1
     return str(source.resolve()), {
         "database": str(database.resolve()),
@@ -114,7 +132,15 @@ def _compile_context(entry: dict, database: Path) -> tuple[str, dict] | None:
         "definitions": definitions,
         "command_digest": hashlib.sha256("\0".join(tokens).encode()).hexdigest() if tokens else "",
         "command_executed": False,
+        # Private scanner-only field. It is removed before report serialization.
+        # The allowlist excludes plugins, response files, linker/output flags and
+        # sensitive -D values.
+        "_semantic_arguments": semantic_arguments[:2_000],
     }
+
+
+def _public_compile_context(context: dict | None) -> dict:
+    return {key: value for key, value in (context or {}).items() if not str(key).startswith("_")}
 
 
 def load_compile_commands(paths: list[Path]) -> tuple[dict[str, dict], dict]:
@@ -161,6 +187,9 @@ SOURCE_RULES = [
     rule("cpp", "Botan", "runtime-selected", r"\b(?P<method>Botan::(?:TLS|Cipher_Mode|PK_Signer|PK_Verifier|HashFunction)[A-Za-z0-9_:]*)"),
     rule("cpp", "Crypto++", "runtime-selected", r"\b(?P<method>CryptoPP::(?:RSA|ECDSA|AES|GCM|SHA|DH)[A-Za-z0-9_:]*)"),
     rule("cpp", "wolfSSL", "TLS", r"\b(?P<method>wolfSSL_[A-Za-z0-9_]+)\s*\("),
+    rule("cpp", "POSIX dynamic loader", "runtime-selected", r"\b(?P<method>(?:dlopen|dlmopen|dlsym))\s*\(", "dynamic_loading_review"),
+    rule("cpp", "Windows dynamic loader", "runtime-selected", r"\b(?P<method>(?:LoadLibrary[AW]?|GetProcAddress))\s*\(", "dynamic_loading_review"),
+    rule("cpp", "Qt meta-object", "runtime-selected", r"\b(?P<method>QMetaObject::invokeMethod)\s*\(", "dynamic_loading_review"),
 
     rule("java", "JCA/JCE", "runtime-selected", r"\b(?P<method>Cipher\.getInstance)\s*\(\s*[\"'](?P<algorithm>[^\"']+)"),
     rule("java", "JCA/JCE", "runtime-selected", r"\b(?P<method>Signature\.getInstance)\s*\(\s*[\"'](?P<algorithm>[^\"']+)"),
@@ -207,6 +236,7 @@ BINARY_RULES = [
     rule("cpp", "Botan", "runtime-selected", r"\b(?P<method>Botan::(?:TLS|Cipher_Mode|PK_Signer|PK_Verifier|HashFunction)[A-Za-z0-9_:]*)", "demangled_symbol"),
     rule("cpp", "Crypto++", "runtime-selected", r"\b(?P<method>CryptoPP::(?:RSA|ECDSA|AES|GCM|SHA|DH)[A-Za-z0-9_:]*)", "demangled_symbol"),
     rule("cpp", "wolfSSL", "TLS", r"\b(?P<method>wolfSSL_[A-Za-z0-9_]+)\b", "binary_symbol"),
+    rule("cpp", "dynamic-loader", "runtime-selected", r"\b(?P<method>(?:dlopen|dlmopen|dlsym|LoadLibrary[AW]?|GetProcAddress|QMetaObject::invokeMethod))\b", "dynamic_loading_review"),
     rule("java", "JSSE", "TLS", r"(?P<method>javax[/\.]net[/\.]ssl[/\.]SSLContext|SSLContext\.getInstance)", "class_constant"),
     rule("java", "JCA/JCE", "runtime-selected", r"(?P<method>javax[/\.]crypto[/\.]Cipher|Cipher\.getInstance)", "class_constant"),
     rule("java", "JCA/JCE", "runtime-selected", r"(?P<method>java[/\.]security[/\.](?:Signature|KeyStore|MessageDigest|KeyPairGenerator))", "class_constant"),
@@ -324,7 +354,7 @@ CPP_SKIP_CALLS = {
 def _cpp_macros(text: str, compile_context: dict | None) -> dict[str, dict]:
     macros: dict[str, dict] = {}
     for name, value in (compile_context or {}).get("definitions", {}).items():
-        macros[name] = {"parameters": [], "body": str(value), "source": "compile_commands"}
+        macros[name] = {"parameters": [], "body": str(value), "source": "compile_commands", "function_like": False}
     pattern = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)(?:\(([^)]*)\))?\s*(.*)$")
     for number, line in enumerate(text.splitlines(), 1):
         match = pattern.match(line)
@@ -333,37 +363,117 @@ def _cpp_macros(text: str, compile_context: dict | None) -> dict[str, dict]:
         parameters = [item.strip() for item in (match.group(2) or "").split(",") if item.strip()]
         macros[match.group(1)] = {
             "parameters": parameters, "body": match.group(3).strip(), "source": "source", "line": number,
+            "function_like": match.group(2) is not None,
         }
     return macros
 
 
+def _split_cpp_arguments(value: str) -> list[str]:
+    output: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth = max(0, depth - 1)
+        elif character == "," and depth == 0:
+            output.append(value[start:index].strip())
+            start = index + 1
+    output.append(value[start:].strip())
+    return output
+
+
+def _replace_function_macro(text: str, name: str, parameters: list[str], body: str) -> tuple[str, int]:
+    pattern = re.compile(rf"\b{re.escape(name)}\s*\(")
+    output: list[str] = []
+    cursor = 0
+    replacements = 0
+    while True:
+        match = pattern.search(text, cursor)
+        if not match:
+            output.append(text[cursor:])
+            break
+        opening = text.find("(", match.start())
+        depth = 1
+        quote = ""
+        escaped = False
+        closing = -1
+        for index in range(opening + 1, len(text)):
+            character = text[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+        if closing < 0:
+            output.append(text[cursor:])
+            break
+        arguments = _split_cpp_arguments(text[opening + 1:closing])
+        if not parameters and arguments == [""]:
+            arguments = []
+        if len(arguments) != len(parameters):
+            output.append(text[cursor:closing + 1])
+            cursor = closing + 1
+            continue
+        replacement = body
+        # Token stringification/pasting is intentionally left to Clang.  The
+        # bounded fallback still handles arbitrarily nested ordinary arguments.
+        if "##" in replacement or re.search(r"(^|[^#])#\s*[A-Za-z_]", replacement):
+            output.append(text[cursor:closing + 1])
+            cursor = closing + 1
+            continue
+        for parameter, argument in zip(parameters, arguments):
+            replacement = re.sub(rf"\b{re.escape(parameter)}\b", argument, replacement)
+        output.append(text[cursor:match.start()])
+        output.append(replacement)
+        replacements += 1
+        cursor = closing + 1
+    return "".join(output), replacements
+
+
 def _macro_expand(line: str, macros: dict[str, dict]) -> tuple[str, list[str]]:
-    """Bounded expansion for object-like and simple, non-nested function macros."""
+    """Bounded expansion for nested object/function-like macro aliases."""
     expanded = line
     used: list[str] = []
-    for _ in range(4):
+    for _ in range(32):
         changed = False
         for name, spec in macros.items():
             body = str(spec.get("body", ""))
             parameters = list(spec.get("parameters", []))
             if not body:
                 continue
-            if not parameters:
+            if not spec.get("function_like"):
                 candidate, count = re.subn(rf"\b{re.escape(name)}\b", body, expanded)
             else:
-                invocation = re.compile(rf"\b{re.escape(name)}\s*\(([^()]*)\)")
-
-                def replace(match: re.Match[str]) -> str:
-                    arguments = [item.strip() for item in match.group(1).split(",")]
-                    if len(arguments) != len(parameters):
-                        return match.group(0)
-                    result = body
-                    for parameter, argument in zip(parameters, arguments):
-                        result = re.sub(rf"\b{re.escape(parameter)}\b", argument, result)
-                    return result
-
-                candidate, count = invocation.subn(replace, expanded)
+                candidate, count = _replace_function_macro(expanded, name, parameters, body)
             if count:
+                if len(candidate) > 200_000:
+                    return expanded, sorted(set(used))
                 expanded = candidate
                 used.append(name)
                 changed = True
@@ -372,8 +482,41 @@ def _macro_expand(line: str, macros: dict[str, dict]) -> tuple[str, list[str]]:
     return expanded, sorted(set(used))
 
 
-def scan_cpp_source(path: Path, text: str, compile_context: dict | None = None) -> tuple[list[dict], dict]:
-    """Add compile metadata, bounded macro expansion and a conservative call graph."""
+def _scan_cpp_dynamic_resolution(path: Path, text: str) -> list[dict]:
+    output: list[dict] = []
+    symbol_pattern = re.compile(
+        r"\b(?P<loader>dlsym|GetProcAddress|QMetaObject::invokeMethod)\s*\([^,]+,\s*(?:Q_ARG\s*\([^,]+,\s*)?[\"'](?P<symbol>[A-Za-z_][A-Za-z0-9_:]*)[\"']",
+    )
+    library_pattern = re.compile(r"\b(?P<loader>dlopen|dlmopen|LoadLibrary[AW]?)\s*\(\s*[\"'](?P<library>[^\"']+)[\"']")
+    for line_number, line in enumerate(text.splitlines(), 1):
+        for match in symbol_pattern.finditer(line):
+            symbol = match.group("symbol")
+            matches = scan_source_text(path, f"{symbol}();", "cpp")
+            for signal in matches:
+                signal.update({
+                    "line": line_number, "source": "cpp_dynamic_symbol_resolution", "confidence": "HIGH",
+                    "evidence_type": "dynamic_symbol_resolution", "excerpt": line.strip()[:500],
+                    "metadata": {"loader": match.group("loader"), "resolved_symbol": symbol},
+                })
+                output.append(signal)
+        for match in library_pattern.finditer(line):
+            library = match.group("library")
+            if not CRYPTO_LIBRARY.search("/" + library):
+                continue
+            output.append({
+                "line": line_number, "evidence_type": "dynamic_crypto_library", "algorithm": "runtime-selected",
+                "excerpt": line.strip()[:500], "language": "cpp", "method": library,
+                "library": library, "confidence": "HIGH", "artifact_type": "source",
+                "source": "cpp_dynamic_library_resolution",
+                "metadata": {"loader": match.group("loader"), "library_path": library},
+            })
+    return output
+
+
+def scan_cpp_source(path: Path, text: str, compile_context: dict | None = None, *,
+                    semantic_mode: str = "auto", clang_binary: str = "clang++",
+                    clang_timeout: int = 20, max_clang_ast_bytes: int = 32_000_000) -> tuple[list[dict], dict]:
+    """Combine fast heuristics with optional bounded Clang AST semantics."""
     macros = _cpp_macros(text, compile_context)
     signals: list[dict] = []
     edges: list[dict] = []
@@ -434,12 +577,40 @@ def scan_cpp_source(path: Path, text: str, compile_context: dict | None = None) 
             "confidence": "MEDIUM", "artifact_type": "source", "source": "cpp_call_graph",
             "metadata": {"caller": edge["caller"], "callee": edge["callee"], "heuristic": True},
         })
+    signals.extend(_scan_cpp_dynamic_resolution(path, text))
+
+    semantic_metadata: dict = {"status": "disabled"}
+    should_analyze = semantic_mode == "on" or (semantic_mode == "auto" and compile_context is not None)
+    if should_analyze:
+        semantic_signals, semantic_metadata = analyze_cpp_source(
+            path, compile_context, clang_binary=clang_binary,
+            timeout=clang_timeout, max_ast_bytes=max_clang_ast_bytes,
+        )
+        semantic_seen = {(int(item.get("line", 0)), item.get("method", ""), item.get("source", "")) for item in signals}
+        for signal in semantic_signals:
+            key = (int(signal.get("line", 0)), signal.get("method", ""), signal.get("source", ""))
+            if key not in semantic_seen:
+                semantic_seen.add(key)
+                signals.append(signal)
+
+    semantic_status = semantic_metadata.get("status", "disabled")
+    if semantic_status in {"succeeded", "partial"}:
+        analysis_limits = [
+            "runtime_dependent_indirect_targets", "cross_dso_dynamic_targets",
+            "packed_binary_requires_runtime_observation", "compile_command_not_executed",
+        ]
+    else:
+        analysis_limits = [
+            "bounded_macro_expansion", "heuristic_call_graph", "semantic_analysis_unavailable",
+            "compile_command_not_executed",
+        ]
     metadata = {
-        "compile_commands": compile_context or {},
+        "compile_commands": _public_compile_context(compile_context),
         "macro_count": len(macros),
         "macro_names": sorted(macros)[:1000],
         "call_graph": edges[:10_000],
-        "analysis_limits": ["bounded_macro_expansion", "heuristic_call_graph", "compile_command_not_executed"],
+        "cpp_semantic": semantic_metadata,
+        "analysis_limits": analysis_limits,
     }
     return signals, metadata
 
@@ -494,10 +665,11 @@ def _relevant_symbol(name: str) -> bool:
     return any(item.pattern.search(name) for item in BINARY_RULES)
 
 
-def _elf_metadata(path: Path) -> tuple[list[str], list[str], list[str], list[str]]:
+def _elf_metadata(path: Path) -> tuple[list[str], list[str], list[str], dict, list[str]]:
     dependencies: set[str] = set()
     raw_symbols: set[str] = set()
     tools: list[str] = []
+    metadata: dict = {}
     rc, dynamic = _run_tool(["readelf", "-d", "--", str(path)])
     if rc == 0:
         tools.append("readelf-dynamic")
@@ -517,12 +689,22 @@ def _elf_metadata(path: Path) -> tuple[list[str], list[str], list[str], list[str
                 name = line.split()[-1] if line.split() else ""
                 if name:
                     raw_symbols.add(name.split("@", 1)[0])
+    rc, section_text = _run_tool(["readelf", "-SW", "--", str(path)])
+    if rc == 0:
+        tools.append("readelf-sections")
+        section_names = sorted(set(re.findall(r"\[\s*\d+\]\s+(\S+)", section_text)))
+        metadata.update({
+            "section_names": section_names[:500],
+            "has_symbol_table": ".symtab" in section_names,
+            "has_dynamic_symbols": ".dynsym" in section_names,
+            "stripped": ".symtab" not in section_names,
+        })
     demangled, used = _demangle_symbols(sorted(raw_symbols))
     if used:
         tools.append("c++filt")
     relevant_raw = sorted(name for name in raw_symbols if _relevant_symbol(name))
     relevant_demangled = sorted(name for name in demangled if _relevant_symbol(name))
-    return sorted(dependencies), relevant_raw, relevant_demangled, tools
+    return sorted(dependencies), relevant_raw, relevant_demangled, metadata, tools
 
 
 def _archive_metadata(path: Path) -> tuple[list[str], list[str], dict, list[str]]:
@@ -603,15 +785,41 @@ def _infer_binary_languages(strings: list[str], file_format: str) -> list[str]:
         languages.add("rust")
     if re.search(r"PyInstaller|Py_Initialize|cryptography\.hazmat|ssl\.SSLContext", blob):
         languages.add("python")
-    if re.search(r"SSL_CTX_|EVP_|std::__cxx11|CryptoPP::|Botan::|wolfSSL_", blob):
+    if re.search(r"SSL_CTX_|EVP_|std::__cxx11|CryptoPP::|Botan::|wolfSSL_|libstdc\+\+|__cxa_", blob):
         languages.add("cpp")
     if not languages:
         languages.add("native" if file_format in {"ELF", "PE", "Mach-O", "static_archive"} else "unknown")
     return sorted(languages)
 
 
+def _binary_protection_metadata(raw: bytes, metadata: dict) -> dict:
+    marker_names = []
+    known_markers = {
+        b"UPX!": "UPX", b"MPRESS": "MPRESS", b"Themida": "Themida",
+        b"VMProtect": "VMProtect", b"ASPack": "ASPack",
+    }
+    for marker, name in known_markers.items():
+        if marker in raw:
+            marker_names.append(name)
+    section_names = [str(item).lower() for item in metadata.get("section_names", [])]
+    suspicious_sections = [
+        item for item in section_names
+        if item.startswith((".upx", ".vmp", ".packed", ".aspack")) or item in {".petite", ".mpress1", ".mpress2"}
+    ]
+    packed = bool(marker_names or suspicious_sections)
+    stripped = bool(metadata.get("stripped"))
+    return {
+        "packed_or_protected": packed,
+        "packer_markers": sorted(set(marker_names)),
+        "suspicious_sections": suspicious_sections[:100],
+        "analysis_completeness": "opaque" if packed else "reduced" if stripped else "normal",
+    }
+
+
 def inspect_file(path: Path, max_text_bytes: int, max_binary_bytes: int, max_evidence: int = 2_000,
-                 cpp_compile_context: dict | None = None) -> tuple[Artifact | None, list[dict], dict]:
+                 cpp_compile_context: dict | None = None, *, cpp_semantic_mode: str = "auto",
+                 clang_binary: str = "clang++", clang_timeout: int = 20,
+                 max_clang_ast_bytes: int = 32_000_000) -> tuple[Artifact | None, list[dict], dict]:
     """Inspect one file and return a crypto-relevant artifact plus signals.
 
     The statistics dictionary is returned even when no cryptographic signal was
@@ -637,22 +845,32 @@ def inspect_file(path: Path, max_text_bytes: int, max_binary_bytes: int, max_evi
         source_language = language or "config"
         cpp_metadata: dict = {}
         if source_language == "cpp":
-            signals, cpp_metadata = scan_cpp_source(path, text, cpp_compile_context)
+            signals, cpp_metadata = scan_cpp_source(
+                path, text, cpp_compile_context, semantic_mode=cpp_semantic_mode,
+                clang_binary=clang_binary, clang_timeout=clang_timeout,
+                max_clang_ast_bytes=max_clang_ast_bytes,
+            )
             signals = signals[:max_evidence]
         else:
             signals = scan_source_text(path, text, source_language)[:max_evidence]
         if not signals:
-            return None, [], {"kind": "source", "language": source_language}
+            return None, [], {
+                "kind": "source", "language": source_language,
+                "cpp_semantic": cpp_metadata.get("cpp_semantic", {}).get("status", "not_applicable") if source_language == "cpp" else "not_applicable",
+            }
         kind = "executable_script" if raw.startswith(b"#!") and executable else "source"
         artifact = Artifact(
             artifact_id=stable_id("artifact", digest, path.resolve()), path=str(path.resolve()),
             artifact_type=kind, file_format="text", sha256=digest, size=info.st_size,
             executable=executable, languages=[source_language], confidence="HIGH",
-            metadata={"inspection": ["bounded_text_parser"] + (["compile_commands", "macro_expansion", "cpp_call_graph"] if source_language == "cpp" else []), **cpp_metadata},
+            metadata={"inspection": ["bounded_text_parser"] + (["compile_commands", "macro_expansion", "cpp_call_graph", "clang_ast_optional"] if source_language == "cpp" else []), **cpp_metadata},
         )
         for signal in signals:
             signal["artifact_type"] = kind
-        return artifact, signals, {"kind": "source", "language": source_language}
+        return artifact, signals, {
+            "kind": "source", "language": source_language,
+            "cpp_semantic": cpp_metadata.get("cpp_semantic", {}).get("status", "not_applicable") if source_language == "cpp" else "not_applicable",
+        }
 
     file_format = _file_format(path, raw)
     if file_format == "binary" and not executable:
@@ -663,7 +881,7 @@ def inspect_file(path: Path, max_text_bytes: int, max_binary_bytes: int, max_evi
     inspection = ["bounded_printable_strings"]
     metadata: dict = {}
     if file_format == "ELF":
-        dependencies, imported_symbols, demangled_symbols, tools = _elf_metadata(path)
+        dependencies, imported_symbols, demangled_symbols, metadata, tools = _elf_metadata(path)
         inspection.extend(tools)
         strings = _printable_strings(raw)
     elif file_format == "PE":
@@ -681,6 +899,7 @@ def inspect_file(path: Path, max_text_bytes: int, max_binary_bytes: int, max_evi
         strings = _printable_strings(raw)
     else:
         strings = _printable_strings(raw)
+    metadata.update(_binary_protection_metadata(raw, metadata))
     mangled_markers = sorted(set(re.findall(r"\b_Z[A-Za-z0-9_$.]+", "\n".join(strings))))[:50_000]
     marker_demangled, marker_tool = _demangle_symbols(mangled_markers)
     if marker_tool and marker_demangled:
@@ -727,6 +946,44 @@ def inspect_file(path: Path, max_text_bytes: int, max_binary_bytes: int, max_evi
                     "method": dependency, "library": dependency, "confidence": "HIGH",
                     "artifact_type": "native_executable", "source": "dynamic_section",
                 })
+    resolvers = sorted(set(re.findall(r"\b(?:dlopen|dlmopen|dlsym|LoadLibrary[AW]?|GetProcAddress)\b", blob)))
+    if resolvers:
+        crypto_strings = [
+            item for item in signals
+            if item.get("library") not in {"dynamic-loader", "POSIX dynamic loader", "Windows dynamic loader"}
+            and item.get("source") == "printable_strings"
+        ]
+        for item in crypto_strings[:100]:
+            key = ("dynamic-resolution", item["method"], resolvers[0])
+            if key in seen or len(signals) >= max_evidence:
+                continue
+            seen.add(key)
+            signals.append({
+                **item,
+                "evidence_type": "dynamic_symbol_resolution",
+                "excerpt": f"dynamic resolver {resolvers[0]} co-occurs with crypto symbol {item['method']}",
+                "confidence": "MEDIUM", "source": "binary_dynamic_resolution",
+                "metadata": {"resolvers": resolvers, "resolved_symbol_candidate": item["method"]},
+            })
+
+    opaque = bool(metadata.get("packed_or_protected"))
+    stripped_unresolved = (
+        bool(metadata.get("stripped")) and not imported_symbols and not demangled_symbols
+        and not any(CRYPTO_LIBRARY.search("/" + item) for item in dependencies)
+    )
+    if opaque or stripped_unresolved:
+        method = "packed-or-protected-binary" if opaque else "fully-stripped-binary"
+        signals.append({
+            "line": 0, "evidence_type": "binary_analysis_gap", "algorithm": "unknown",
+            "excerpt": f"static analysis is incomplete for {method}; correlate with process maps or eBPF",
+            "language": languages[0], "method": method, "library": "binary-analysis",
+            "confidence": "LOW", "artifact_type": "native_executable",
+            "source": "binary_protection_analysis",
+            "metadata": {
+                "packed_or_protected": opaque, "stripped": bool(metadata.get("stripped")),
+                "requires_runtime_observation": True,
+            },
+        })
     if not signals:
         return None, [], {"kind": "binary", "format": file_format}
     artifact_type = "java_archive" if file_format == "JAR" else "java_class" if file_format == "JavaClass" else "native_executable" if executable or file_format in {"ELF", "PE", "Mach-O"} else "binary_archive"

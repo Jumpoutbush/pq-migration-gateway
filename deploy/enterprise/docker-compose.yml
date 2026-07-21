@@ -2,7 +2,7 @@ name: pq-migration-gateway-enterprise
 
 services:
   gateway:
-    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.7}"
     container_name: pq-enterprise-gateway
     network_mode: host
     user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
@@ -33,7 +33,7 @@ services:
     restart: unless-stopped
 
   manager-api:
-    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.7}"
     container_name: pq-enterprise-manager-api
     network_mode: host
     user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
@@ -51,6 +51,7 @@ services:
       - /var/lib/pq-control
     environment:
       MANAGER_API_TOKEN: "${MANAGER_API_TOKEN:?set by make enterprise-init}"
+      RUNTIME_AGENT_TOKEN: "${RUNTIME_AGENT_TOKEN:-}"
       PQ_CONFIG_SIGNING_KEY: "${PQ_CONFIG_SIGNING_KEY:?set by make enterprise-init}"
       PQ_SCAN_ALLOWED_ROOTS: /workspace/project
       PQ_PROCESS_SCAN_ENABLED: "${PQ_PROCESS_SCAN_ENABLED:-0}"
@@ -70,7 +71,7 @@ services:
     restart: unless-stopped
 
   metrics-agent:
-    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.6}"
+    image: "${PQ_GATEWAY_IMAGE:-pq-migration-gateway-pq-gateway:3.7}"
     container_name: pq-enterprise-metrics-agent
     user: "${PQ_RUNTIME_UID:-1000}:${PQ_RUNTIME_GID:-1000}"
     depends_on:

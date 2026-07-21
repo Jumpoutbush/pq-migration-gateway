@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# PQC Migration Gateway v3.6 complete experiment.
+# PQC Migration Gateway v3.7 complete experiment.
 # Default build path uses the WSL proxy at 127.0.0.1:7897.
 # Usage:
 #   ./scripts/run_full_experiment.sh
@@ -51,7 +51,7 @@ done
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_DIR="${RESULT_ROOT}/${TIMESTAMP}"
-IMAGE="pq-migration-gateway-pq-gateway:3.6"
+IMAGE="pq-migration-gateway-pq-gateway:3.7"
 PROXY_URL="${WSL_PROXY:-http://127.0.0.1:7897}"
 OPENSSL_BIN="/opt/openssl/bin/openssl"
 CA_CONTAINER="/etc/pq-gateway/certs/ca.crt"
@@ -154,7 +154,7 @@ def load(path,default=None):
     if not p.exists():return default or {}
     return json.loads(p.read_text())
 static=load('crypto-inventory.json').get('summary',{});tls=load('tls-inventory.json').get('summary',{});risk=load('risk-report.json').get('summary',{});verify=load('migration-verification.json').get('summary',{});db=load('inventory-db-summary.json');mtls=load('mtls/mtls-matrix.json').get('summary',{});up=load('upstream/upstream-tls-matrix.json').get('summary',{});stream=load('stream/stream-protocol-matrix.json').get('summary',{});runtime=load('runtime-fallback-report.json').get('summary',{});experiment=load('experiment-fallback-report.json').get('summary',{});perf=load('performance/performance-report.json').get('summary',{});disc=load('network-discovery.json').get('summary',{});cmdb=load('cmdb-targets.json').get('summary',{});enterprise=load('enterprise-scan/enterprise-crypto-inventory.json').get('summary',{});enterprise_matrix=load('enterprise-scan/enterprise-scanner-matrix.json').get('summary',{});api_matrix=load('scan-migration-api/scan-migration-api-matrix.json').get('summary',{});api_first=load('api-first/api-first-matrix.json').get('summary',{})
-text=f'''# PQC Migration Gateway v3.6 Experiment Summary
+text=f'''# PQC Migration Gateway v3.7 Experiment Summary
 
 ## Overall result
 
@@ -256,6 +256,8 @@ main(){
   python3 scripts/test_enterprise_scanner.py "$RESULT_DIR/enterprise-scan"
   log 'Running scan-to-asset-to-migration REST API workflow matrix'
   python3 scripts/test_scan_migration_api.py "$RESULT_DIR/scan-migration-api"
+  log 'Running live backend-to-Runtime-Agent-to-enterprise-asset REST API workflow matrix'
+  python3 scripts/test_runtime_agent_workflow.py "$RESULT_DIR/runtime-agent"
   log 'Running API-first onboarding, service publication, status and rollback workflow matrix'
   python3 scripts/test_api_first_workflow.py "$RESULT_DIR/api-first"
   log 'Importing sample CMDB assets into normalized targets'
@@ -287,8 +289,8 @@ main(){
   log "Running complete performance suite profile=$PERF_PROFILE"
   PERF_PROFILE="$PERF_PROFILE" ./scripts/run_performance_suite.sh "$RESULT_DIR/performance"
   write_summary
-  write_status PASS 'All v3.6 experiments completed successfully' 0
+  write_status PASS 'All v3.7 experiments completed successfully' 0
   publish_latest || die "Could not update latest experiment pointer"
-  log "All v3.6 experiments completed: $RESULT_DIR"
+  log "All v3.7 experiments completed: $RESULT_DIR"
 }
 main "$@"

@@ -43,6 +43,21 @@
 - target non-execution trap;
 - SQLite artifact/process persistence and risk correlation in offline regression tests.
 
+## Running backend discovery
+
+- launch an isolated TLS-capable backend fixture;
+- read its live `/proc/<pid>/maps` through the same Runtime Agent collector used in enterprise mode; isolated CI runners whose child PID namespace is not exposed use a deterministic procfs fixture with the running fixture PID;
+- link an authorized crypto-call trace to the live PID and process start time;
+- reject report submission with the operator token and accept the dedicated Runtime Agent token;
+- retain a failed upload in the Agent spool and remove it only after acknowledgement;
+- ingest the batch idempotently into Runtime Agent, process and observation tables;
+- normalize the running workload into `crypto_assets` and link call evidence through `scan_findings`;
+- expose the ingested state through the authenticated runtime and asset REST APIs.
+
+The deterministic matrix uses an imported authorized trace so it does not
+require privileged BPF access. The optional eBPF profile must additionally be
+validated on the target Linux/WSL kernel.
+
 ## Performance
 
 - Hybrid/PQC and X25519 handshake latency, P50/P95/P99 and throughput;

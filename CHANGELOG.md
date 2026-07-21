@@ -1,5 +1,29 @@
 # Changelog
 
+## 3.7.0
+
+### Runtime discovery Agent
+
+- Added a host/container Runtime Agent that reads bounded `/proc` process maps and cgroup metadata without executing target programs.
+- Added optional fixed, allowlisted bpftrace uprobes for actual OpenSSL/liboqs-style crypto API call evidence.
+- Added disk spooling, retry-safe batch identifiers and idempotent Manager API ingestion.
+- Added a separate Runtime Agent bearer token and authenticated `/v1/runtime/*` API surface.
+- Added persistent Runtime Agent, process instance, batch and cumulative observation tables.
+- Normalized running workloads and runtime observations into the existing cryptographic asset and finding database.
+- Added a hardened process-map container deployment and an explicit opt-in eBPF override.
+- Added end-to-end tests for process/container attribution, secret redaction, fixed probe generation, authentication, deduplication and asset linkage.
+- Added cgroup-v2 probe filtering and workload attribution for nested WSL/Docker PID namespaces where procfs and bpftrace report different PIDs.
+
+### C++ semantic discovery
+
+- Added a bounded Clang JSON AST analyzer that never executes targets or replays arbitrary compilation commands.
+- Added allowlisted compilation-context handling with plugin/response/link/output flag rejection and sensitive macro redaction.
+- Added semantic evidence for templates, nested macros, statically known function pointers, conservative virtual dispatch and transitive wrappers.
+- Added source and binary correlation for `dlopen`/`dlsym`, `LoadLibrary`/`GetProcAddress` and Qt meta-object invocation.
+- Added explicit reduced/opaque completeness metadata and low-confidence analysis-gap findings for stripped or packed native binaries.
+- Added fallback behavior when Clang is unavailable, times out or produces an oversized/partial AST.
+- Added regression coverage for semantic AST parsing, compile-flag safety, deep macros, dynamic loading and protected binary retention.
+
 ## 3.6.0
 
 ### API-first enterprise control plane

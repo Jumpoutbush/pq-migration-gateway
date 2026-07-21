@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticated v3.6 API-first Gateway control plane."""
+"""Authenticated v3.7 API-first Gateway control plane."""
 from __future__ import annotations
 
 import argparse
@@ -32,6 +32,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     store: ConfigStore
     control_dir: Path
     token: str
+    runtime_agent_token: str = ""
     metrics_public = True
     max_body = 2 * 1024 * 1024
     scanner: ScanOrchestrator
@@ -63,8 +64,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path in {"/healthz", "/openapi.json"} or (path == "/metrics" and self.metrics_public):
             return True
         supplied = self.headers.get("Authorization", "")
-        expected = "Bearer " + self.token
-        return bool(self.token) and hmac.compare_digest(supplied, expected)
+        token = (self.runtime_agent_token or self.token) if self.command == "POST" and path == "/v1/runtime/reports" else self.token
+        expected = "Bearer " + token
+        return bool(token) and hmac.compare_digest(supplied, expected)
 
     def body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -108,7 +110,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.reply(200, openapi_document(f"http://{host}"))
         elif self.command == "GET" and path == "/healthz":
             latest = self.store.latest_version()
-            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.6.0", "latest_release": latest["version"] if latest else None})
+            self.reply(200, {"status": "ok", "component": "manager-api", "version": "3.7.0", "latest_release": latest["version"] if latest else None})
         elif self.command == "GET" and path == "/metrics":
             self.reply_text(200, self.store.prometheus_text(), "text/plain; version=0.0.4; charset=utf-8")
         elif self.command == "GET" and path == "/v1/metrics":
@@ -116,9 +118,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         elif self.command == "GET" and path == "/v1/capabilities":
             registry = default_registry()
             self.reply(200, {
-                "api_version": "3.6.0",
+                "api_version": "3.7.0",
                 "adapters": [{"name": name, "plane": registry.get(name).plane} for name in registry.names()],
                 "authorized_scan_roots": [str(item) for item in self.scanner.allowed_roots],
+                "scanner": {
+                    "cpp_semantic": {
+                        "engine": "clang-ast-json", "default": "auto",
+                        "modes": ["auto", "on", "off"],
+                        "compile_command_replayed": False,
+                        "detects": [
+                            "templates", "nested_macros", "function_pointers",
+                            "virtual_dispatch_candidates", "dynamic_symbol_resolution",
+                        ],
+                    },
+                },
+                "runtime_discovery": {
+                    "report_endpoint": "POST /v1/runtime/reports",
+                    "sources": ["proc-maps", "container-cgroup", "fixed-ebpf-uprobes", "trace-import"],
+                    "separate_agent_token": bool(self.runtime_agent_token),
+                    "target_execution": False,
+                },
                 "release_lifecycle": [
                     "DRAFT", "VALIDATED", "STAGED", "APPLIED", "HEALTHY",
                     "VALIDATION_FAILED", "NGINX_TEST_FAILED", "RELOAD_FAILED",
@@ -132,6 +151,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "workflows": {
                     "onboard_and_publish": "POST /v1/onboarding",
                     "scan": "POST /v1/scans",
+                    "runtime_discovery": "POST /v1/runtime/reports",
                     "asset_migration": "POST /v1/assets/{asset_id}/migration",
                     "rollback": "POST /v1/releases/{version}/rollback",
                 },
@@ -151,6 +171,22 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.reply(200, self.store.get_scan_job(match.group(1)))
         elif self.command == "GET" and (match := re.fullmatch(r"/v1/scans/([A-Za-z0-9._-]+)/findings", path)):
             self.reply(200, {"items": self.store.list_scan_findings(match.group(1), self.limit(query, 1000))})
+        elif self.command == "POST" and path == "/v1/runtime/reports":
+            self.reply(202, self.store.ingest_runtime_report(self.body(), self.actor()))
+        elif self.command == "GET" and path == "/v1/runtime/agents":
+            stale_after = float(query.get("stale_after", ["90"])[0])
+            self.reply(200, {"items": self.store.list_runtime_agents(stale_after)})
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/runtime/agents/([A-Za-z0-9._-]+)", path)):
+            self.reply(200, self.store.get_runtime_agent(match.group(1), self.limit(query)))
+        elif self.command == "GET" and path == "/v1/runtime/batches":
+            self.reply(200, {"items": self.store.list_runtime_batches(self.limit(query))})
+        elif self.command == "GET" and (match := re.fullmatch(r"/v1/runtime/batches/([A-Za-z0-9._-]+)", path)):
+            self.reply(200, self.store.get_runtime_batch(match.group(1)))
+        elif self.command == "GET" and path == "/v1/runtime/observations":
+            self.reply(200, {"items": self.store.list_runtime_observations(
+                self.limit(query, 500), agent_id=str(query.get("agent_id", [""])[0])[:128],
+                asset_id=str(query.get("asset_id", [""])[0])[:128],
+            )})
         elif self.command == "GET" and path == "/v1/assets":
             self.reply(200, {"items": self.store.list_crypto_assets(self.limit(query, 500))})
         elif self.command == "GET" and (match := re.fullmatch(r"/v1/assets/([A-Za-z0-9._-]+)", path)):
@@ -265,6 +301,7 @@ def main() -> int:
     parser.add_argument("--db", default="runtime-data/control/control-plane.db")
     parser.add_argument("--control-dir", default="runtime-data/control")
     parser.add_argument("--token", default=os.environ.get("MANAGER_API_TOKEN", ""))
+    parser.add_argument("--runtime-agent-token", default=os.environ.get("RUNTIME_AGENT_TOKEN", ""))
     parser.add_argument("--private-metrics", action="store_true", help="Require the bearer token for /metrics")
     parser.add_argument("--scan-root", action="append", default=[], help="Authorized scan root; may be repeated")
     parser.add_argument("--scan-workers", type=int, default=2)
@@ -277,6 +314,7 @@ def main() -> int:
     ApiHandler.store = ConfigStore(args.db)
     ApiHandler.control_dir = Path(args.control_dir)
     ApiHandler.token = args.token
+    ApiHandler.runtime_agent_token = args.runtime_agent_token
     ApiHandler.metrics_public = not args.private_metrics
     environment_roots = [item for item in os.environ.get("PQ_SCAN_ALLOWED_ROOTS", "").split(os.pathsep) if item]
     allowed_roots = args.scan_root + environment_roots or [str(ROOT)]
@@ -286,7 +324,7 @@ def main() -> int:
         ebpf_enabled=args.enable_ebpf or os.environ.get("PQ_EBPF_ENABLED") == "1",
     )
     server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
-    print(f"manager-api v3.6 listening on {args.host}:{args.port}", file=sys.stderr)
+    print(f"manager-api v3.7 listening on {args.host}:{args.port}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

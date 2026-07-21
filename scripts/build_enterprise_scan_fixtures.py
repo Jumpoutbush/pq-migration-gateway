@@ -23,6 +23,27 @@ void *configure_tls() {
 }
 void *migration_wrapper() { return configure_tls(); }
 """,
+    "advanced.cpp": """extern "C" void *SSL_CTX_new(void *);
+extern "C" int EVP_PKEY_encrypt(void *, void *, unsigned long *, const void *, unsigned long);
+extern "C" int RSA_public_encrypt(int);
+extern "C" void *dlsym(void *, const char *);
+#define DEEP1(x) SSL_CTX_new(x)
+#define DEEP2(x) DEEP1((x))
+#define DEEP3(x) DEEP2((x))
+#define DEEP4(x) DEEP3((x))
+template<class T> int templated_crypto(T value) {
+    return EVP_PKEY_encrypt(nullptr, nullptr, nullptr, nullptr, static_cast<unsigned long>(value));
+}
+using CryptoFn = int (*)(int);
+int pointer_crypto() { CryptoFn fn = &RSA_public_encrypt; return fn(1); }
+struct CryptoBase { virtual int apply(int) = 0; };
+struct CryptoDerived : CryptoBase {
+    int apply(int value) override { return templated_crypto(value); }
+};
+int virtual_crypto(CryptoBase &service) { return service.apply(1); }
+void *nested_macro(void *method) { return DEEP4(method); }
+void *dynamic_crypto(void *handle) { return dlsym(handle, "RSA_public_encrypt"); }
+""",
     "CryptoService.java": """import javax.crypto.Cipher;
 import javax.net.ssl.SSLContext;
 class CryptoService {
@@ -59,10 +80,16 @@ def write_sources(root: Path) -> None:
         path.write_text(text, encoding="utf-8")
         if path.suffix in {".py", ".sh"}:
             path.chmod(0o755)
-    (root / "compile_commands.json").write_text(json.dumps([{
-        "directory": str(root.resolve()), "file": "service.cpp",
-        "arguments": ["g++", "-std=c++20", "-DPQ_SCAN_FIXTURE=1", "-Iinclude", "-c", "service.cpp"],
-    }], indent=2) + "\n", encoding="utf-8")
+    (root / "compile_commands.json").write_text(json.dumps([
+        {
+            "directory": str(root.resolve()), "file": "service.cpp",
+            "arguments": ["g++", "-std=c++20", "-DPQ_SCAN_FIXTURE=1", "-Iinclude", "-c", "service.cpp"],
+        },
+        {
+            "directory": str(root.resolve()), "file": "advanced.cpp",
+            "arguments": ["g++", "-std=c++20", "-DPQ_ADVANCED_SCAN=1", "-c", "advanced.cpp"],
+        },
+    ], indent=2) + "\n", encoding="utf-8")
 
 
 def build_native(root: Path) -> tuple[Path, str]:

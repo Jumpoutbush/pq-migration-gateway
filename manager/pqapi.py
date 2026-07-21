@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""REST-only CLI and automation client for PQ Gateway Manager API v3.6."""
+"""REST-only CLI and automation client for PQ Gateway Manager API v3.7."""
 from __future__ import annotations
 
 import argparse
@@ -50,11 +50,23 @@ def main() -> int:
     scan_create = scan_cmd.add_parser("create")
     scan_create.add_argument("--root", action="append", default=[])
     scan_create.add_argument("--compile-commands", action="append", default=[])
+    scan_create.add_argument("--cpp-semantic", choices=("auto", "on", "off"), default="auto")
     scan_create.add_argument("--wait", action="store_true")
     scan_create.add_argument("--timeout", type=float, default=300)
     scan_cmd.add_parser("list")
     scan_get = scan_cmd.add_parser("get");scan_get.add_argument("id")
     scan_findings = scan_cmd.add_parser("findings");scan_findings.add_argument("id")
+
+    runtime = commands.add_parser("runtime")
+    runtime_cmd = runtime.add_subparsers(dest="command", required=True)
+    runtime_cmd.add_parser("agents")
+    runtime_agent = runtime_cmd.add_parser("agent");runtime_agent.add_argument("id")
+    runtime_cmd.add_parser("batches")
+    runtime_batch = runtime_cmd.add_parser("batch");runtime_batch.add_argument("id")
+    runtime_observations = runtime_cmd.add_parser("observations")
+    runtime_observations.add_argument("--agent-id", default="")
+    runtime_observations.add_argument("--asset-id", default="")
+    runtime_observations.add_argument("--limit", type=int, default=500)
 
     asset = commands.add_parser("asset")
     asset_cmd = asset.add_subparsers(dest="command", required=True)
@@ -95,8 +107,18 @@ def main() -> int:
             elif args.command == "findings": result = client.request("GET", f"/v1/scans/{quote(args.id, safe='')}/findings")
             else:
                 roots = args.root or ["/workspace/project"]
-                result = client.create_scan(roots, args.compile_commands)
+                result = client.create_scan(roots, args.compile_commands, cpp_semantic=args.cpp_semantic)
                 if args.wait: result = client.wait_scan(str(result["scan_id"]), args.timeout)
+        elif args.area == "runtime":
+            if args.command == "agents": result = client.request("GET", "/v1/runtime/agents")
+            elif args.command == "agent": result = client.request("GET", f"/v1/runtime/agents/{quote(args.id, safe='')}")
+            elif args.command == "batches": result = client.request("GET", "/v1/runtime/batches")
+            elif args.command == "batch": result = client.request("GET", f"/v1/runtime/batches/{quote(args.id, safe='')}")
+            else:
+                query = f"?limit={max(1, min(args.limit, 5000))}"
+                if args.agent_id: query += "&agent_id=" + quote(args.agent_id, safe="")
+                if args.asset_id: query += "&asset_id=" + quote(args.asset_id, safe="")
+                result = client.request("GET", "/v1/runtime/observations" + query)
         elif args.area == "asset":
             if args.command == "list": result = client.request("GET", "/v1/assets")
             elif args.command == "get": result = client.request("GET", f"/v1/assets/{quote(args.id, safe='')}")

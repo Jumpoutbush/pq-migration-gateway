@@ -1,0 +1,34 @@
+services:
+  runtime-agent:
+    # bpftrace's cgroup builtin reports IDs from the runtime's cgroup
+    # namespace.  Join that namespace so /sys/fs/cgroup exposes the same
+    # hierarchy when resolving target container IDs from /host/proc.
+    cgroup: host
+    environment:
+      PQ_RUNTIME_EBPF: "1"
+      PQ_RUNTIME_HOST_ROOT: /host/root
+      PQ_RUNTIME_EBPF_PROC_ROOT: /proc
+      PQ_RUNTIME_CGROUP_ROOT: /sys/fs/cgroup
+      PQ_RUNTIME_EBPF_MAX_PROBES: "${PQ_RUNTIME_EBPF_MAX_PROBES:-64}"
+    command:
+      - watch
+      - --proc-root
+      - /host/proc
+      - --host-root
+      - /host/root
+      - --spool-dir
+      - /var/lib/pq-runtime-agent/spool
+      - --interval
+      - "${PQ_RUNTIME_AGENT_INTERVAL:-30}"
+      - --ebpf
+      - --ebpf-duration
+      - "${PQ_RUNTIME_EBPF_DURATION:-5}"
+      - --ebpf-proc-root
+      - /proc
+    volumes:
+      - /:/host/root:ro
+      - /sys:/sys:ro
+      # bpftrace creates uprobe definitions here. Keep the rest of /sys read-only.
+      - /sys/kernel/debug/tracing:/sys/kernel/debug/tracing:rw
+      - /lib/modules:/lib/modules:ro
+    cap_add: ["SYS_PTRACE", "DAC_READ_SEARCH", "BPF", "PERFMON", "SYS_RESOURCE"]

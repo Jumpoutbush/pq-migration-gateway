@@ -45,7 +45,7 @@ FROM ubuntu:24.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates gettext-base curl python3 zlib1g libpcre3 mosquitto-clients netcat-openbsd iproute2 binutils \
+    ca-certificates gettext-base curl python3 zlib1g libpcre3 mosquitto-clients netcat-openbsd iproute2 binutils clang \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/pq-gateway/templates /etc/pq-gateway/certs /etc/pq-gateway/config \
        /opt/pq-gateway/bin /opt/pq-gateway/gateway /opt/pq-gateway/manager /opt/pq-gateway/scanner /opt/pq-gateway/scripts \

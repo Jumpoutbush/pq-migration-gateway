@@ -1,4 +1,4 @@
-"""Enterprise onboarding helpers for the v3.6 API-first deployment profile."""
+"""Enterprise onboarding helpers for the v3.7 API-first deployment profile."""
 from __future__ import annotations
 
 import json
@@ -90,13 +90,14 @@ def initialize(root: str | Path, scan_root: str | Path, *, server_name: str = "p
         "MANAGER_API_TOKEN": existing.get("MANAGER_API_TOKEN") or secrets.token_hex(32),
         "PQ_CONFIG_SIGNING_KEY": existing.get("PQ_CONFIG_SIGNING_KEY") or secrets.token_hex(32),
         "PQ_EBPF_ENABLED": existing.get("PQ_EBPF_ENABLED", "0"),
-        "PQ_GATEWAY_IMAGE": "pq-migration-gateway-pq-gateway:3.6",
+        "PQ_GATEWAY_IMAGE": "pq-migration-gateway-pq-gateway:3.7",
         "PQ_MANAGER_API_BIND": existing.get("PQ_MANAGER_API_BIND", "127.0.0.1"),
         "PQ_MANAGER_API_URL": existing.get("PQ_MANAGER_API_URL", "http://127.0.0.1:18080"),
         "PQ_PROCESS_SCAN_ENABLED": existing.get("PQ_PROCESS_SCAN_ENABLED", "0"),
         "PQ_RUNTIME_GID": os.getgid() if hasattr(os, "getgid") else 1000,
         "PQ_RUNTIME_UID": os.getuid() if hasattr(os, "getuid") else 1000,
         "PQ_SCAN_HOST_ROOT": str(scan),
+        "RUNTIME_AGENT_TOKEN": existing.get("RUNTIME_AGENT_TOKEN") or secrets.token_hex(32),
     }
     if force or not env_path.exists():
         write_env(env_path, values)
@@ -104,14 +105,14 @@ def initialize(root: str | Path, scan_root: str | Path, *, server_name: str = "p
         # Updating the authorized root is safe and does not rotate existing secrets.
         values.update(existing)
         values["PQ_SCAN_HOST_ROOT"] = str(scan)
-        values["PQ_GATEWAY_IMAGE"] = "pq-migration-gateway-pq-gateway:3.6"
+        values["PQ_GATEWAY_IMAGE"] = "pq-migration-gateway-pq-gateway:3.7"
         write_env(env_path, values)
     if force or not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
         document = default_document(server_name, port)
         normalize_config(document)
         config_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    for relative in ("logs", "metrics", "scans", "control", "certs", "prometheus", "grafana"):
+    for relative in ("logs", "metrics", "scans", "control", "certs", "prometheus", "grafana", "runtime-agent"):
         (project / "runtime-data" / "enterprise" / relative).mkdir(parents=True, exist_ok=True)
     return {
         "environment": str(env_path),

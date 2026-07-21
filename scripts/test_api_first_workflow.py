@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the deterministic v3.6 API-first customer workflow matrix."""
+"""Run the deterministic v3.7 API-first customer workflow matrix."""
 from __future__ import annotations
 
 import argparse
@@ -67,7 +67,7 @@ def main() -> int:
         try:
             with urllib.request.urlopen(base + "/openapi.json", timeout=5) as response:
                 contract = json.loads(response.read())
-            check("openapi_contract", contract["info"]["version"] == "3.6.0")
+            check("openapi_contract", contract["info"]["version"] == "3.7.0")
             capabilities = client.capabilities()
             check("capability_discovery", "http" in {item["name"] for item in capabilities["adapters"]}, capabilities["authorized_scan_roots"])
             initial = client.status()

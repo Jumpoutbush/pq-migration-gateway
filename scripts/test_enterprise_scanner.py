@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the v3.6 enterprise crypto discovery experiment matrix."""
+"""Run the v3.7 enterprise crypto discovery experiment matrix."""
 from __future__ import annotations
 
 import argparse
@@ -35,15 +35,18 @@ def main() -> int:
     inventory = json.loads(inventory_json.read_text(encoding="utf-8"))
     evidence = inventory["evidence"]
     artifacts = inventory["artifacts"]
+    semantic_available = inventory["summary"].get("cpp_semantic_files", 0) > 0
 
     def has(**expected: str) -> bool:
         return any(all(str(row.get(key, "")) == value for key, value in expected.items()) for row in evidence)
 
     tests = [
         ("cpp_source_openssl", has(language="cpp", method="SSL_CTX_new", source="source_parser")),
-        ("cpp_compile_commands", inventory["summary"].get("compile_database_entries", 0) >= 1),
+        ("cpp_compile_commands", inventory["summary"].get("compile_database_entries", 0) >= 2),
         ("cpp_macro_expansion", has(language="cpp", method="SSL_CTX_new", source="cpp_macro_expansion")),
+        ("cpp_deep_nested_macro", any(Path(row["path"]).name == "advanced.cpp" and row["method"] == "SSL_CTX_new" and row["source"] == "cpp_macro_expansion" for row in evidence)),
         ("cpp_call_graph", any(row["source"] == "cpp_call_graph" and "migration_wrapper" in row["method"] for row in evidence)),
+        ("cpp_dynamic_symbol_resolution", any(Path(row["path"]).name == "advanced.cpp" and row["method"] == "RSA_public_encrypt" and row["source"] in {"cpp_dynamic_symbol_resolution", "cpp_clang_dynamic_resolution"} for row in evidence)),
         ("java_source_jca", has(language="java", method="Cipher.getInstance", source="source_parser")),
         ("rust_source_rustls", has(language="rust", method="rustls::ClientConfig::builder", source="source_parser")),
         ("go_source_tls", has(language="go", method="tls.Config", source="source_parser")),
@@ -62,6 +65,12 @@ def main() -> int:
         ("target_never_executed", not Path(manifest["execution_marker"]).exists()),
         ("json_and_csv_outputs", inventory_json.stat().st_size > 0 and inventory_csv.stat().st_size > 0),
     ]
+    if semantic_available:
+        tests.extend([
+            ("cpp_clang_template", any(row["source"] in {"cpp_clang_template", "cpp_clang_call_graph"} and "advanced.cpp" in row["path"] for row in evidence)),
+            ("cpp_clang_function_pointer", any(row["source"] == "cpp_clang_function_pointer" and "advanced.cpp" in row["path"] for row in evidence)),
+            ("cpp_clang_virtual_dispatch", any(row["source"] == "cpp_clang_virtual_dispatch" and "advanced.cpp" in row["path"] for row in evidence)),
+        ])
     rows = [{"test": name, "status": "PASS" if passed else "FAIL"} for name, passed in tests]
     summary = {"tests": len(rows), "passed": sum(row["status"] == "PASS" for row in rows), "failed": sum(row["status"] == "FAIL" for row in rows)}
     payload = {
@@ -76,6 +85,7 @@ def main() -> int:
             "rust": manifest["rust_fixture_mode"],
             "java": manifest["java_fixture_mode"],
         },
+        "cpp_semantic_available": semantic_available,
         "results": rows,
     }
     (output / "enterprise-scanner-matrix.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

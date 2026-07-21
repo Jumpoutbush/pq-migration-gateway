@@ -73,6 +73,10 @@ class ScanOrchestrator:
         if not isinstance(compile_commands, list) or len(compile_commands) > 32:
             raise ValueError("compile_commands must be a list with at most 32 entries")
         normalized["compile_commands"] = [str(self._authorized_path(item)) for item in compile_commands]
+        cpp_semantic = str(request.get("cpp_semantic", "auto")).lower()
+        if cpp_semantic not in {"auto", "on", "off"}:
+            raise ValueError("cpp_semantic must be one of: auto, on, off")
+        normalized["cpp_semantic"] = cpp_semantic
         traces = request.get("ebpf_trace_files", [])
         if not isinstance(traces, list) or len(traces) > 32:
             raise ValueError("ebpf_trace_files must be a list with at most 32 entries")
@@ -120,6 +124,7 @@ class ScanOrchestrator:
             command += ["--root", root]
         for database in request.get("compile_commands", []):
             command += ["--compile-commands", database]
+        command += ["--cpp-semantic", request.get("cpp_semantic", "auto")]
         for trace in request.get("ebpf_trace_files", []):
             command += ["--ebpf-trace-file", trace]
         if request.get("scan_processes"):

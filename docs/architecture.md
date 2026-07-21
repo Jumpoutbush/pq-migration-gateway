@@ -1,18 +1,23 @@
 # Architecture
 
-PQC Migration Gateway v3.6 separates enterprise crypto discovery, API-first persistent control-plane state and traffic execution, while connecting scan assets to guarded migration releases and a dedicated enterprise operations profile.
+PQC Migration Gateway v3.7 separates enterprise crypto discovery, API-first persistent control-plane state and traffic execution, while connecting scan assets to guarded migration releases and a dedicated enterprise operations profile.
 
 ```text
-Source / binaries / JAR / processes / CMDB / endpoints / CIDR
+Source / binaries / JAR / CMDB / endpoints / CIDR
                 |
                 v
 Discovery + inventory + risk assessment
                 |
                 v
+Running backend -> Runtime Agent -> /proc/cgroup/fixed eBPF
+                |                         |
+                +----------+--------------+
+                           v
 +-------------------- Control plane --------------------+
-| pqctl / manager-api / Prometheus endpoint            |
-| Service + Policy + ConfigVersion + MigrationState    |
-| config-store -> desired release -> Agent heartbeat   |
+| pqctl / manager-api / Prometheus endpoint             |
+| static scans + runtime reports -> normalized assets   |
+| Service + Policy + ConfigVersion + MigrationState     |
+| config-store -> desired release -> Agent heartbeat    |
 +--------------------------+----------------------------+
                            | desired version
                            v
@@ -34,7 +39,8 @@ Discovery + inventory + risk assessment
 
 - language adapters identify exact cryptographic API/method references;
 - artifact inspection reads file magic, symbols, dependencies and bounded strings/class constants without executing targets;
-- optional process-map inspection correlates deployed programs with cryptographic libraries;
+- a dedicated Runtime Agent correlates deployed processes/containers with cryptographic libraries and submits idempotent reports;
+- optional fixed, allowlisted eBPF uprobes record actual crypto calls during a bounded observation window;
 - CMDB, CIDR and online TLS collectors provide ownership and observed protocol evidence.
 
 ## Data plane
@@ -51,7 +57,7 @@ HTTP and Stream protocol behavior is no longer embedded in the control plane. Th
 
 ## Security boundary
 
-- The manager API requires a bearer token and is published on host loopback by default.
+- The manager API requires an operator bearer token and is published on host loopback by default; Runtime Agent writes use a separate token when configured.
 - Private keys stay outside the configuration database; the model stores provider references.
 - SHA-256 checksums detect release corruption; optional HMAC-SHA-256 signatures authenticate the publisher when `PQ_CONFIG_SIGNING_KEY` is configured.
 - Logs and audit events contain metadata, never business payloads or private-key material.

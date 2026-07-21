@@ -208,6 +208,84 @@ CREATE TABLE IF NOT EXISTS migration_plans(
   FOREIGN KEY(asset_id) REFERENCES crypto_assets(asset_id)
 );
 CREATE INDEX IF NOT EXISTS idx_migration_plans_asset ON migration_plans(asset_id,updated_at);
+CREATE TABLE IF NOT EXISTS runtime_discovery_agents(
+  agent_id TEXT PRIMARY KEY,
+  hostname TEXT NOT NULL,
+  version TEXT NOT NULL,
+  boot_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  last_seen_epoch REAL NOT NULL,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_discovery_agents_seen ON runtime_discovery_agents(last_seen_epoch);
+CREATE TABLE IF NOT EXISTS runtime_discovery_batches(
+  batch_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  scan_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  collected_at TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  completed_at TEXT,
+  summary_json TEXT NOT NULL,
+  error TEXT,
+  FOREIGN KEY(agent_id) REFERENCES runtime_discovery_agents(agent_id),
+  FOREIGN KEY(scan_id) REFERENCES scan_jobs(scan_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_batches_agent ON runtime_discovery_batches(agent_id,received_at);
+CREATE TABLE IF NOT EXISTS runtime_process_instances(
+  process_instance_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  workload_asset_id TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  start_time_ticks INTEGER NOT NULL,
+  executable TEXT NOT NULL,
+  command TEXT NOT NULL,
+  uid INTEGER NOT NULL,
+  container_id TEXT NOT NULL,
+  container_runtime TEXT NOT NULL,
+  pod_uid TEXT NOT NULL,
+  cgroup TEXT NOT NULL,
+  namespaces_json TEXT NOT NULL,
+  mapped_libraries_json TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  last_seen_epoch REAL NOT NULL,
+  FOREIGN KEY(agent_id) REFERENCES runtime_discovery_agents(agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_process_agent ON runtime_process_instances(agent_id,last_seen_epoch);
+CREATE INDEX IF NOT EXISTS idx_runtime_process_asset ON runtime_process_instances(workload_asset_id,last_seen_epoch);
+CREATE TABLE IF NOT EXISTS runtime_observations(
+  observation_key TEXT PRIMARY KEY,
+  latest_batch_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  process_instance_id TEXT NOT NULL,
+  workload_asset_id TEXT NOT NULL,
+  evidence_type TEXT NOT NULL,
+  method TEXT NOT NULL,
+  library TEXT NOT NULL,
+  algorithm TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  pq_status TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  source TEXT NOT NULL,
+  observation_count INTEGER NOT NULL,
+  first_observed TEXT NOT NULL,
+  last_observed TEXT NOT NULL,
+  last_observed_epoch REAL NOT NULL,
+  payload_json TEXT NOT NULL,
+  FOREIGN KEY(latest_batch_id) REFERENCES runtime_discovery_batches(batch_id),
+  FOREIGN KEY(agent_id) REFERENCES runtime_discovery_agents(agent_id),
+  FOREIGN KEY(process_instance_id) REFERENCES runtime_process_instances(process_instance_id),
+  FOREIGN KEY(workload_asset_id) REFERENCES crypto_assets(asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_agent ON runtime_observations(agent_id,last_observed_epoch);
+CREATE INDEX IF NOT EXISTS idx_runtime_observations_asset ON runtime_observations(workload_asset_id,last_observed_epoch);
 """
 
 
@@ -517,6 +595,204 @@ class ConfigStore:
             self._audit_conn(conn, now, actor, "scan.ingest", "scan_job", scan_id, summary)
         return self.get_scan_job(scan_id)
 
+    def ingest_runtime_report(self, payload: dict, actor: str) -> dict:
+        """Idempotently persist a Runtime Agent batch and normalize its assets."""
+        from manager.runtime_ingest import normalize_runtime_report, runtime_inventory
+
+        report = normalize_runtime_report(payload)
+        batch_id = str(report["batch_id"])
+        agent = report["agent"]
+        agent_id = str(agent["id"])
+        scan_id = "runtime-scan-" + __import__("hashlib").sha256(f"{agent_id}\0{batch_id}".encode()).hexdigest()[:24]
+        now, epoch = utc_now(), unix_now()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT agent_id,status FROM runtime_discovery_batches WHERE batch_id=?", (batch_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["agent_id"]) != agent_id:
+                    raise ValueError("runtime batch_id is already owned by another agent")
+                if str(existing["status"]) == "INGESTED":
+                    return self.get_runtime_batch(batch_id)
+            first = conn.execute(
+                "SELECT first_seen FROM runtime_discovery_agents WHERE agent_id=?", (agent_id,),
+            ).fetchone()
+            first_seen = str(first["first_seen"]) if first else now
+            conn.execute(
+                "INSERT INTO runtime_discovery_agents(agent_id,hostname,version,boot_id,mode,status,capabilities_json,metadata_json,first_seen,last_seen,last_seen_epoch,last_error) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(agent_id) DO UPDATE SET hostname=excluded.hostname,version=excluded.version,"
+                "boot_id=excluded.boot_id,mode=excluded.mode,status=excluded.status,capabilities_json=excluded.capabilities_json,"
+                "metadata_json=excluded.metadata_json,last_seen=excluded.last_seen,last_seen_epoch=excluded.last_seen_epoch,last_error=NULL",
+                (agent_id, agent["hostname"], agent["version"], agent["boot_id"], agent["mode"], "REPORTING",
+                 json.dumps(agent["capabilities"], ensure_ascii=False, sort_keys=True),
+                 json.dumps(agent["metadata"], ensure_ascii=False, sort_keys=True), first_seen, now, epoch),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO scan_jobs(scan_id,scan_type,status,request_json,summary_json,output_path,error,actor,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (scan_id, "runtime-agent", "QUEUED", json.dumps({"agent_id": agent_id, "batch_id": batch_id}, sort_keys=True),
+                 "{}", "", None, actor, now),
+            )
+            conn.execute(
+                "INSERT INTO runtime_discovery_batches(batch_id,agent_id,scan_id,status,collected_at,received_at,completed_at,summary_json,error) "
+                "VALUES(?,?,?,?,?,?,NULL,?,NULL) ON CONFLICT(batch_id) DO UPDATE SET status='RECEIVED',summary_json=excluded.summary_json,error=NULL",
+                (batch_id, agent_id, scan_id, "RECEIVED", report["collected_at"], now,
+                 json.dumps(report["summary"], ensure_ascii=False, sort_keys=True)),
+            )
+        try:
+            self.update_scan_job(scan_id, "RUNNING")
+            self.ingest_scan_inventory(scan_id, runtime_inventory(report), actor)
+            with self.connect() as conn:
+                for process in report["processes"]:
+                    existing = conn.execute(
+                        "SELECT first_seen FROM runtime_process_instances WHERE process_instance_id=?",
+                        (process["process_instance_id"],),
+                    ).fetchone()
+                    first_seen = str(existing["first_seen"]) if existing else now
+                    container = process["container"]
+                    conn.execute(
+                        "INSERT INTO runtime_process_instances(process_instance_id,agent_id,workload_asset_id,pid,start_time_ticks,executable,command,uid,"
+                        "container_id,container_runtime,pod_uid,cgroup,namespaces_json,mapped_libraries_json,metadata_json,first_seen,last_seen,last_seen_epoch) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(process_instance_id) DO UPDATE SET workload_asset_id=excluded.workload_asset_id,"
+                        "executable=excluded.executable,command=excluded.command,uid=excluded.uid,container_id=excluded.container_id,"
+                        "container_runtime=excluded.container_runtime,pod_uid=excluded.pod_uid,cgroup=excluded.cgroup,namespaces_json=excluded.namespaces_json,"
+                        "mapped_libraries_json=excluded.mapped_libraries_json,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen,last_seen_epoch=excluded.last_seen_epoch",
+                        (process["process_instance_id"], agent_id, process["workload_asset_id"], process["pid"], process["start_time_ticks"],
+                         process["executable"], process["command"], process["uid"], container["id"], container["runtime"],
+                         container["pod_uid"], container["cgroup"], json.dumps(process["namespaces"], ensure_ascii=False, sort_keys=True),
+                         json.dumps(process["mapped_crypto_libraries"], ensure_ascii=False, sort_keys=True),
+                         json.dumps(process["metadata"], ensure_ascii=False, sort_keys=True), first_seen, now, epoch),
+                    )
+                for observation in report["observations"]:
+                    conn.execute(
+                        "INSERT INTO runtime_observations(observation_key,latest_batch_id,agent_id,process_instance_id,workload_asset_id,evidence_type,method,library,"
+                        "algorithm,risk,pq_status,confidence,source,observation_count,first_observed,last_observed,last_observed_epoch,payload_json) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(observation_key) DO UPDATE SET latest_batch_id=excluded.latest_batch_id,"
+                        "observation_count=runtime_observations.observation_count+excluded.observation_count,last_observed=excluded.last_observed,"
+                        "last_observed_epoch=excluded.last_observed_epoch,payload_json=excluded.payload_json",
+                        (observation["observation_key"], batch_id, agent_id, observation["process_instance_id"], observation["workload_asset_id"],
+                         observation["evidence_type"], observation["method"], observation["library"], observation["algorithm"],
+                         observation["risk"], observation["pq_status"], observation["confidence"], observation["source"], observation["count"],
+                         observation["observed_at"], observation["observed_at"], epoch,
+                         json.dumps(observation, ensure_ascii=False, sort_keys=True)),
+                    )
+                conn.execute(
+                    "UPDATE runtime_discovery_batches SET status='INGESTED',completed_at=?,summary_json=?,error=NULL WHERE batch_id=?",
+                    (now, json.dumps(report["summary"], ensure_ascii=False, sort_keys=True), batch_id),
+                )
+                conn.execute(
+                    "UPDATE runtime_discovery_agents SET status='HEALTHY',last_error=NULL,last_seen=?,last_seen_epoch=? WHERE agent_id=?",
+                    (now, epoch, agent_id),
+                )
+                self._audit_conn(conn, now, actor, "runtime.ingest", "runtime_batch", batch_id, {
+                    "agent_id": agent_id, "scan_id": scan_id, **report["summary"],
+                })
+        except Exception as exc:
+            with self.connect() as conn:
+                conn.execute(
+                    "UPDATE runtime_discovery_batches SET status='FAILED',completed_at=?,error=? WHERE batch_id=?",
+                    (utc_now(), str(exc)[:4000], batch_id),
+                )
+                conn.execute(
+                    "UPDATE runtime_discovery_agents SET status='DEGRADED',last_error=? WHERE agent_id=?",
+                    (str(exc)[:4000], agent_id),
+                )
+            self.update_scan_job(scan_id, "FAILED", error=str(exc)[:4000])
+            raise
+        self.set_metric(
+            "runtime_discovery_agent_last_report_timestamp_seconds", epoch, {"agent_id": agent_id}, "gauge",
+            "Unix timestamp of the latest Runtime Agent report.",
+        )
+        self.set_metric(
+            "runtime_discovery_processes", report["summary"]["processes"], {"agent_id": agent_id}, "gauge",
+            "Crypto-relevant running processes observed by a Runtime Agent.",
+        )
+        self.increment_metric(
+            "runtime_crypto_call_observations_total", report["summary"]["runtime_call_observations"], {"agent_id": agent_id},
+            "Cumulative crypto API call observations submitted by Runtime Agents.",
+        )
+        return self.get_runtime_batch(batch_id)
+
+    def get_runtime_batch(self, batch_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM runtime_discovery_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown runtime batch: {batch_id}")
+        result = dict(row)
+        result["summary"] = json.loads(result.pop("summary_json"))
+        return result
+
+    def list_runtime_batches(self, limit: int = 100) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT batch_id FROM runtime_discovery_batches ORDER BY received_at DESC,batch_id DESC LIMIT ?",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [self.get_runtime_batch(str(row["batch_id"])) for row in rows]
+
+    def get_runtime_agent(self, agent_id: str, process_limit: int = 100) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM runtime_discovery_agents WHERE agent_id=?", (agent_id,)).fetchone()
+            processes = conn.execute(
+                "SELECT * FROM runtime_process_instances WHERE agent_id=? ORDER BY last_seen_epoch DESC LIMIT ?",
+                (agent_id, max(1, min(process_limit, 1000))),
+            ).fetchall()
+            counts = conn.execute(
+                "SELECT evidence_type,COUNT(*) AS count,SUM(observation_count) AS observations FROM runtime_observations WHERE agent_id=? GROUP BY evidence_type",
+                (agent_id,),
+            ).fetchall()
+        if row is None:
+            raise KeyError(f"unknown runtime agent: {agent_id}")
+        result = dict(row)
+        result["capabilities"] = json.loads(result.pop("capabilities_json"))
+        result["metadata"] = json.loads(result.pop("metadata_json"))
+        result["processes"] = []
+        for record in processes:
+            item = dict(record)
+            item["namespaces"] = json.loads(item.pop("namespaces_json"))
+            item["mapped_crypto_libraries"] = json.loads(item.pop("mapped_libraries_json"))
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            result["processes"].append(item)
+        result["observation_summary"] = {
+            str(item["evidence_type"]): {"unique": int(item["count"]), "observations": int(item["observations"] or 0)}
+            for item in counts
+        }
+        return result
+
+    def list_runtime_agents(self, stale_after: float = 90.0) -> list[dict]:
+        cutoff = unix_now() - max(1.0, stale_after)
+        with self.connect() as conn:
+            rows = conn.execute("SELECT agent_id FROM runtime_discovery_agents ORDER BY agent_id").fetchall()
+        result = []
+        for row in rows:
+            item = self.get_runtime_agent(str(row["agent_id"]), 20)
+            item["stale"] = float(item["last_seen_epoch"]) < cutoff
+            result.append(item)
+        return result
+
+    def list_runtime_observations(self, limit: int = 500, *, agent_id: str = "", asset_id: str = "") -> list[dict]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if agent_id:
+            clauses.append("agent_id=?")
+            values.append(agent_id)
+        if asset_id:
+            clauses.append("workload_asset_id=?")
+            values.append(asset_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(max(1, min(limit, 5000)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runtime_observations" + where + " ORDER BY last_observed_epoch DESC,observation_key LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
     def list_scan_findings(self, scan_id: str, limit: int = 1000) -> list[dict]:
         self.get_scan_job(scan_id)
         with self.connect() as conn:
@@ -797,6 +1073,9 @@ class ConfigStore:
                 "policies": int(conn.execute("SELECT COUNT(*) FROM policy_resources").fetchone()[0]),
                 "assets": int(conn.execute("SELECT COUNT(*) FROM crypto_assets").fetchone()[0]),
                 "assessments": int(conn.execute("SELECT COUNT(*) FROM asset_assessments").fetchone()[0]),
+                "runtime_agents": int(conn.execute("SELECT COUNT(*) FROM runtime_discovery_agents").fetchone()[0]),
+                "runtime_processes": int(conn.execute("SELECT COUNT(*) FROM runtime_process_instances").fetchone()[0]),
+                "runtime_observations": int(conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone()[0]),
             }
             scans = grouped("scan_jobs", "status")
             plans = grouped("migration_plans", "status")
@@ -805,13 +1084,14 @@ class ConfigStore:
         if latest:
             latest = {key: latest.get(key) for key in ("version", "checksum", "created_at", "operator", "status", "rollback_from", "error")}
         return {
-            "version": "3.6.0",
+            "version": "3.7.0",
             "latest_release": latest,
             "counts": counts,
             "scan_jobs": scans,
             "migration_plans": plans,
             "migration_states": migrations,
             "agents": self.list_agents(stale_after),
+            "runtime_agents": self.list_runtime_agents(max(90.0, stale_after)),
         }
 
     def prometheus_text(self) -> str:

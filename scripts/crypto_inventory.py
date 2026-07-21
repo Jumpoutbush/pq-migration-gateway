@@ -328,6 +328,10 @@ def main() -> int:
     parser.add_argument("--include-command-lines", action="store_true", help="Collect redacted process command lines; disabled by default")
     parser.add_argument("--compile-commands", action="append", default=[], help="Explicit compile_commands.json; may be repeated")
     parser.add_argument("--no-auto-compile-commands", action="store_true", help="Do not discover compile_commands.json below roots")
+    parser.add_argument("--cpp-semantic", choices=("auto", "on", "off"), default="auto", help="Run bounded Clang AST analysis: auto requires compile_commands.json")
+    parser.add_argument("--clang", default="clang++", help="Clang C++ executable used only with -fsyntax-only")
+    parser.add_argument("--clang-timeout", type=positive_int, default=20, help="Maximum Clang analysis seconds per C++ file")
+    parser.add_argument("--max-clang-ast-bytes", type=positive_int, default=32_000_000, help="Maximum JSON AST bytes per C++ file")
     parser.add_argument("--ebpf-trace-file", action="append", default=[], help="Import an authorized JSONL/TSV eBPF trace")
     parser.add_argument("--enable-ebpf", action="store_true", help="Run the fixed bpftrace uprobe collector (requires host privileges)")
     parser.add_argument("--ebpf-pid", type=int, default=0)
@@ -342,7 +346,10 @@ def main() -> int:
     assets: dict[str, Asset] = {}
     evidence: dict[str, Evidence] = {}
     artifacts: dict[str, dict] = {}
-    scan_stats = {"files_seen": 0, "source_files_inspected": 0, "binary_files_inspected": 0, "files_skipped": 0}
+    scan_stats = {
+        "files_seen": 0, "source_files_inspected": 0, "binary_files_inspected": 0, "files_skipped": 0,
+        "cpp_semantic": {name: 0 for name in ("succeeded", "partial", "unavailable", "failed", "timeout", "bounded", "disabled")},
+    }
     excludes = set(DEFAULT_EXCLUDES) | set(args.exclude)
     compile_paths = [Path(item) for item in args.compile_commands]
     if not args.no_auto_compile_commands:
@@ -371,6 +378,8 @@ def main() -> int:
         artifact, signals, inspected = inspect_file(
             path, args.max_text_bytes, args.max_binary_bytes, args.max_evidence_per_file,
             cpp_compile_context=compile_contexts.get(str(path.resolve())),
+            cpp_semantic_mode=args.cpp_semantic, clang_binary=args.clang,
+            clang_timeout=args.clang_timeout, max_clang_ast_bytes=args.max_clang_ast_bytes,
         )
         if inspected.get("kind") == "source":
             scan_stats["source_files_inspected"] += 1
@@ -378,6 +387,9 @@ def main() -> int:
             scan_stats["binary_files_inspected"] += 1
         elif inspected.get("skipped"):
             scan_stats["files_skipped"] += 1
+        semantic_status = inspected.get("cpp_semantic")
+        if semantic_status in scan_stats["cpp_semantic"]:
+            scan_stats["cpp_semantic"][semantic_status] += 1
         artifact_id = artifact.artifact_id if artifact else ""
         if artifact:
             artifacts[artifact.artifact_id] = artifact_dict(artifact)
@@ -425,7 +437,7 @@ def main() -> int:
     confidence = [item.get("confidence", "MEDIUM") for item in evidence_rows]
     payload = {
         "schema_version": 4,
-        "scanner_version": "3.6.0",
+        "scanner_version": "3.7.0",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "roots": [str(p.resolve()) for p in roots],
         "summary": {
@@ -440,6 +452,8 @@ def main() -> int:
             "runtime_crypto_processes": len(runtime_rows),
             "runtime_crypto_api_observations": len(ebpf_events),
             "compile_database_entries": compile_stats["entries"],
+            "cpp_semantic_files": scan_stats["cpp_semantic"]["succeeded"] + scan_stats["cpp_semantic"]["partial"],
+            "cpp_semantic_failures": sum(scan_stats["cpp_semantic"][name] for name in ("failed", "timeout", "bounded")),
             "files_seen": scan_stats["files_seen"],
             "source_files_inspected": scan_stats["source_files_inspected"],
             "binary_files_inspected": scan_stats["binary_files_inspected"],

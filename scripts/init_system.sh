@@ -17,14 +17,14 @@ HEALTH_TIMEOUT="${INIT_HEALTH_TIMEOUT:-120}"
 
 usage() {
   cat <<'EOF'
-PQC Migration Gateway v3.6 system initializer
+PQC Migration Gateway v3.7 system initializer
 
 Usage:
   ./scripts/init_system.sh [options]
   make init INIT_ARGS="[options]"
 
 Options:
-  --skip-build          Use an existing pq-gateway:3.6 image.
+  --skip-build          Use an existing pq-gateway:3.7 image.
   --skip-start          Prepare and publish configuration without starting containers.
   --skip-control-plane  Do not start the optional manager-api profile.
   --prepare-only        Do not require Docker; prepare secrets, PKI and initial release only.
@@ -205,7 +205,7 @@ fi
 log "validating the unified service configuration"
 python3 scripts/render_gateway_config.py \
   --config config/services.json \
-  --output /tmp/pq-gateway-v3.6-init-nginx.conf \
+  --output /tmp/pq-gateway-v3.7-init-nginx.conf \
   --check
 
 if [[ ! -f runtime-data/control/desired.json || "$REAPPLY_CONFIG" == true ]]; then

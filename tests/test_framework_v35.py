@@ -25,14 +25,17 @@ class EnterpriseOnboardingTests(unittest.TestCase):
             config_path = Path(first["config"])
             values = load_env(env_path)
             self.assertEqual(values["PQ_SCAN_HOST_ROOT"], str(scan.resolve()))
-            self.assertEqual(values["PQ_GATEWAY_IMAGE"], "pq-migration-gateway-pq-gateway:3.6")
+            self.assertEqual(values["PQ_GATEWAY_IMAGE"], "pq-migration-gateway-pq-gateway:3.7")
             self.assertEqual(values["PQ_MANAGER_API_BIND"], "127.0.0.1")
             self.assertEqual(values["PQ_MANAGER_API_URL"], "http://127.0.0.1:18080")
             self.assertGreaterEqual(len(values["MANAGER_API_TOKEN"]), 64)
+            self.assertGreaterEqual(len(values["RUNTIME_AGENT_TOKEN"]), 64)
             self.assertEqual(os.stat(env_path).st_mode & 0o777, 0o600)
             token = values["MANAGER_API_TOKEN"]
+            runtime_token = values["RUNTIME_AGENT_TOKEN"]
             initialize(root, scan)
             self.assertEqual(load_env(env_path)["MANAGER_API_TOKEN"], token)
+            self.assertEqual(load_env(env_path)["RUNTIME_AGENT_TOKEN"], runtime_token)
             canonical = normalize_config(json.loads(config_path.read_text(encoding="utf-8")))
             self.assertEqual(canonical["services"][0]["listen"]["port"], 28443)
 

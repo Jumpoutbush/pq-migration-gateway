@@ -1,4 +1,4 @@
-# PQC Migration Gateway v3.6
+# PQC Migration Gateway v3.7
 
 面向异构存量系统的后量子迁移与密码资产发现原型。
 
@@ -171,7 +171,12 @@ PQC Migration Gateway
 │   ├── 二进制、动态库和静态库扫描
 │   ├── 证书和密钥元数据扫描
 │   ├── CMDB/CIDR/在线 TLS 扫描
-│   └── 可选进程映射和 eBPF 证据
+│   └── 静态源码、制品和端点证据
+├── Runtime Agent
+│   ├── 运行进程与容器归属
+│   ├── /proc 密码库映射
+│   ├── 可选固定 eBPF 密码接口观测
+│   └── 可靠上报与离线重试
 └── Metrics Agent
     ├── Hybrid 使用量
     ├── 经典回退率
@@ -219,6 +224,9 @@ Manager API 调用扫描编排器
 | `POST /v1/scans` | 创建异步企业扫描任务 |
 | `GET /v1/scans` | 查询扫描任务 |
 | `GET /v1/scans/{id}/findings` | 查询文件、符号和接口证据 |
+| `POST /v1/runtime/reports` | Runtime Agent 上报进程、容器和调用证据 |
+| `GET /v1/runtime/agents` | 查询 Runtime Agent 与运行进程 |
+| `GET /v1/runtime/observations` | 查询密码库映射和实际接口调用 |
 | `GET /v1/assets` | 查询归一化密码资产 |
 | `POST /v1/assets/{id}/assess` | 风险评估 |
 | `POST /v1/assets/{id}/migration` | 创建、验证或完成迁移计划 |
@@ -255,7 +263,9 @@ Manager API 调用扫描编排器
 - TLS、NGINX、Apache、YAML、JSON、TOML、XML 等配置；
 - X.509 证书和 PEM 私钥元数据；
 - `compile_commands.json` 编译上下文；
-- 有界宏展开和启发式调用关系；
+- 受限的 Clang AST 语义分析，不重放原始编译命令；
+- 复杂模板、嵌套宏、直接调用和跨包装函数调用关系；
+- 可确定的函数指针目标、虚函数候选目标及动态符号加载；
 - ELF、PE、Mach-O 和 WebAssembly；
 - `.so` 动态库和 `.a` 静态库；
 - JAR、WAR、EAR 和 Java class；
@@ -267,7 +277,37 @@ Manager API 调用扫描编排器
 - CIDR 网段发现；
 - 在线 TLS、证书和 group 探测。
 
-扫描器不执行目标程序，不执行 `compile_commands.json`，不保存私钥内容。扫描证据分为高、中等置信度，字符串命中不代表接口一定被执行。
+扫描器不执行目标程序，也不执行 `compile_commands.json` 中的原始命令。它只从编译数据库提取经过白名单过滤的标准版本、头文件路径和非敏感宏，再以 `clang++ -fsyntax-only` 生成有大小和超时限制的 AST。编译器插件、响应文件、链接参数、输出参数和敏感宏值不会传入 Clang。Clang 不可用或解析失败时自动回退到宏展开和启发式调用图，不会中断整个扫描任务。
+
+默认 `auto` 模式仅对具有编译数据库上下文的 C++ 文件启用语义分析。也可以显式控制：
+
+```bash
+python3 scripts/crypto_inventory.py \
+  --root /srv/company/apps \
+  --compile-commands /srv/company/apps/build/compile_commands.json \
+  --cpp-semantic on \
+  --out-json inventory.json \
+  --out-csv inventory.csv
+```
+
+通过扫描 API 时可在请求中设置 `"cpp_semantic":"auto"`、`"on"` 或 `"off"`。对于运行时才决定的函数指针、跨动态库虚调用和动态加载目标，仍需结合进程映射或运行观测。裁剪、加壳程序会被保留为“分析不完整”证据，不再因为没有符号而被当作无密码资产。扫描器不保存私钥内容；字符串命中也不代表接口一定被执行。
+
+### 9.1 运行中后端扫描
+
+v3.7 增加独立 Runtime Agent，可部署在真实后端主机或容器节点：
+
+```text
+运行中后端
+  → /proc 进程映射和 cgroup 容器归属
+  → 可选固定 eBPF 密码接口调用
+  → 认证、落盘缓存和幂等上报
+  → Manager API
+  → runtime 表 + crypto_assets + scan_findings
+```
+
+`/proc` 证据说明进程加载了某个密码库；eBPF 证据说明采样窗口内确实调用了某个允许的密码接口。Agent 不执行目标程序，不接收任意探针程序，默认也不采集命令行。完整部署与权限说明见 [`docs/runtime-agent.md`](docs/runtime-agent.md)。
+
+默认 Agent 检查所在主机或节点上的运行进程；已知后端 PID 也可用重复的 `--pid` 参数限定范围。跨主机时必须在对应后端主机或 Kubernetes 节点部署 Agent，Manager 不能远程读取另一台机器的 `/proc`。
 
 ## 10. 扫描到迁移闭环
 
@@ -331,7 +371,7 @@ ROLLED_BACK
 
 两套环境共用代码和 Docker 镜像，但使用不同 Compose 配置、容器、运行数据和服务对象。通常交替运行，避免争用 `18080`、`8443` 等端口。
 
-Enterprise 不是模拟企业实体，也不是单独的下游接口。它是一套包含 Gateway、Manager API、Metrics Agent、数据库和持久化目录的企业部署方式。
+Enterprise 不是模拟企业实体，也不是单独的下游接口。它是一套包含 Gateway、Manager API、Metrics Agent、数据库和持久化目录的企业部署方式；Runtime Agent 按需部署到真实业务主机或容器节点。
 
 ## 13. 项目边界
 
@@ -447,7 +487,7 @@ docker build \
   --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
   --build-arg no_proxy=localhost,127.0.0.1,::1 \
   -f docker/Dockerfile.gateway \
-  -t pq-migration-gateway-pq-gateway:3.6 \
+  -t pq-migration-gateway-pq-gateway:3.7 \
   .
 ```
 
@@ -610,6 +650,8 @@ runtime-data/enterprise/
 │           └── inventory.csv
 ├── certs/
 ├── config/
+├── runtime-agent/
+│   └── spool/
 └── metrics/
 ```
 
@@ -745,7 +787,7 @@ PERF_PROFILE=stress ./scripts/run_full_experiment.sh --latest
 成功标志：
 
 ```text
-All v3.6 experiments completed: experiment-results/<UTC时间戳>
+All v3.7 experiments completed: experiment-results/<UTC时间戳>
 ```
 
 查看：
@@ -761,518 +803,4 @@ cat experiment-results/latest/SUMMARY.md
 experiment-results/latest/
 ├── experiment-status.json
 ├── SUMMARY.md
-├── mtls/mtls-matrix.json
-├── upstream/upstream-tls-matrix.json
-├── stream/stream-protocol-matrix.json
-├── enterprise-scan/enterprise-scanner-matrix.json
-├── scan-migration-api/scan-migration-api-matrix.json
-├── api-first/
-├── crypto-inventory.json
-├── tls-inventory.json
-├── network-discovery.json
-├── risk-report.json
-├── inventory.db
-├── migration-verification.json
-└── performance/
-```
-
-### 23.5 本机 REST 测试出现空 502
-
-若看到：
-
-```text
-POST /v1/scans -> HTTP 502 Bad Gateway; body=''
-```
-
-并且本地 `ApiHandler` 调试函数没有被调用，检查：
-
-```bash
-python3 - <<'PY'
-import urllib.request
-print(urllib.request.getproxies())
-print(urllib.request.proxy_bypass("127.0.0.1"))
-PY
-```
-
-如果输出 `False`，说明 `urllib` 没有识别 `NO_PROXY` 中的 `127.*`。使用精确的 `127.0.0.1`，或者让进程内测试使用 `ProxyHandler({})`。
-
-### 23.6 结束普通实验
-
-```bash
-docker compose \
-  -f docker-compose.yml \
-  down --remove-orphans
-
-docker stop pq-manager-api 2>/dev/null || true
-```
-
----
-
-## 24. Enterprise 实验
-
-### 24.1 停止普通实验环境
-
-```bash
-cd ~/wkspace/pq-migration-gateway
-
-docker compose \
-  -f docker-compose.yml \
-  down --remove-orphans
-
-docker stop pq-manager-api 2>/dev/null || true
-```
-
-### 24.2 初始化和启动
-
-首次初始化：
-
-```bash
-make enterprise-init \
-  SCAN_ROOT="$PWD" \
-  SERVER_NAME=payment-gateway.company.local \
-  LISTEN_PORT=28443
-```
-
-已经初始化时直接启动：
-
-```bash
-make enterprise-up
-make enterprise-status
-make enterprise-capabilities
-```
-
-### 24.3 建立临时后端
-
-在新的 WSL 终端检查端口：
-
-```bash
-ss -ltnp 'sport = :18082'
-```
-
-如果没有输出，启动：
-
-```bash
-cd /tmp
-python3 -m http.server 18082 --bind 127.0.0.1
-```
-
-保持该终端运行。在项目终端测试：
-
-```bash
-curl -I --connect-timeout 5 \
-  http://127.0.0.1:18082/
-
-docker exec pq-enterprise-gateway \
-  curl -I --connect-timeout 5 \
-  http://127.0.0.1:18082/
-```
-
-预期：
-
-```text
-HTTP/1.0 200 OK
-```
-
-如果 `18082` 被占用，可以使用 `18083`，并同步修改服务配置。
-
-### 24.4 创建完整兼容模式配置
-
-优先从模板复制：
-
-```bash
-cp config/enterprise/service-onboarding.example.json \
-  payment-service.json
-```
-
-将占位上游替换为临时后端：
-
-```bash
-sed -i \
-  's#http://payment.internal:8080#http://127.0.0.1:18082#g' \
-  payment-service.json
-```
-
-完整配置示例：
-
-```json
-{
-  "id": "payment-pqc-gateway",
-  "adapter": "http",
-  "listen": {
-    "address": "0.0.0.0",
-    "port": 28443,
-    "server_name": "payment-gateway.company.local"
-  },
-  "downstream_tls": {
-    "mode": "compatibility",
-    "groups": [
-      "X25519MLKEM768",
-      "X25519"
-    ],
-    "certificate": "/etc/pq-gateway/certs/server.crt",
-    "private_key": {
-      "provider": "file",
-      "reference": "/etc/pq-gateway/certs/server.key"
-    },
-    "client_auth": "off",
-    "client_ca": "/etc/pq-gateway/certs/ca.crt"
-  },
-  "upstream": {
-    "address": "http://127.0.0.1:18082",
-    "tls": {
-      "enabled": false,
-      "verify": "off",
-      "sni": "",
-      "ca": "/etc/ssl/certs/ca-certificates.crt",
-      "client_identity": {
-        "certificate": "",
-        "private_key": {
-          "provider": "file",
-          "reference": ""
-        }
-      }
-    }
-  },
-  "protocol_options": {},
-  "timeouts": {
-    "connect": "5s",
-    "read": "60s",
-    "send": "60s"
-  },
-  "rollout": {
-    "fallback_allowed": true,
-    "hybrid_percentage": 100,
-    "policy": "fixed"
-  },
-  "audit": {
-    "enabled": true
-  }
-}
-```
-
-验证 JSON：
-
-```bash
-python3 -m json.tool payment-service.json >/dev/null \
-  && echo "JSON 格式正确"
-```
-
-### 24.5 发布兼容模式
-
-```bash
-make enterprise-api-onboard \
-  SERVICE_FILE=payment-service.json
-
-sleep 5
-
-make enterprise-history
-make enterprise-status
-```
-
-成功条件：
-
-```text
-latest_release.status = HEALTHY
-current_version = desired_version
-agent.status = HEALTHY
-```
-
-### 24.6 验证兼容模式
-
-Hybrid：
-
-```bash
-docker exec -i pq-enterprise-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect 127.0.0.1:28443 \
-  -servername payment-gateway.company.local \
-  -tls1_3 \
-  -groups X25519MLKEM768 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief </dev/null
-```
-
-经典 X25519：
-
-```bash
-docker exec -i pq-enterprise-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect 127.0.0.1:28443 \
-  -servername payment-gateway.company.local \
-  -tls1_3 \
-  -groups X25519 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief </dev/null
-```
-
-兼容模式下两条命令都应成功。
-
-完整 Hybrid 业务转发：
-
-```bash
-printf 'GET / HTTP/1.1\r\nHost: payment-gateway.company.local\r\nConnection: close\r\n\r\n' \
-  | docker exec -i pq-enterprise-gateway \
-      /opt/openssl/bin/openssl s_client \
-      -connect 127.0.0.1:28443 \
-      -servername payment-gateway.company.local \
-      -tls1_3 \
-      -groups X25519MLKEM768 \
-      -CAfile /etc/pq-gateway/certs/ca.crt \
-      -quiet
-```
-
-预期收到 Python 临时后端的 `HTTP/1.0 200 OK`。
-
-### 24.7 扫描密码资产
-
-日常调用不需要再次传入宿主机 `SCAN_ROOT`：
-
-```bash
-make enterprise-scan
-```
-
-创建并等待完成：
-
-```bash
-set -a
-source .env.enterprise
-set +a
-
-python3 manager/pqapi.py scan create \
-  --root /workspace/project \
-  --wait
-```
-
-查询：
-
-```bash
-python3 manager/pqapi.py scan list
-python3 manager/pqapi.py scan get SCAN_ID
-python3 manager/pqapi.py scan findings SCAN_ID
-
-make enterprise-assets
-python3 manager/pqapi.py asset list
-python3 manager/pqapi.py asset get ASSET_ID
-```
-
-风险评估：
-
-```bash
-python3 manager/pqapi.py asset assess ASSET_ID
-```
-
-### 24.8 发布严格模式
-
-先记录当前兼容版本：
-
-```bash
-make enterprise-history
-```
-
-修改 `payment-service.json`：
-
-```json
-"downstream_tls": {
-  "mode": "strict",
-  "groups": [
-    "X25519MLKEM768"
-  ]
-}
-```
-
-保留 `certificate`、`private_key`、`client_auth` 和 `client_ca` 字段。
-
-同时修改：
-
-```json
-"rollout": {
-  "fallback_allowed": false,
-  "hybrid_percentage": 100,
-  "policy": "fixed"
-}
-```
-
-发布：
-
-```bash
-make enterprise-api-onboard \
-  SERVICE_FILE=payment-service.json
-
-sleep 5
-
-make enterprise-history
-make enterprise-status
-```
-
-### 24.9 验证严格模式
-
-Hybrid 应成功：
-
-```bash
-docker exec -i pq-enterprise-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect 127.0.0.1:28443 \
-  -servername payment-gateway.company.local \
-  -tls1_3 \
-  -groups X25519MLKEM768 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief </dev/null
-```
-
-经典 X25519 应失败：
-
-```bash
-docker exec -i pq-enterprise-gateway \
-  /opt/openssl/bin/openssl s_client \
-  -connect 127.0.0.1:28443 \
-  -servername payment-gateway.company.local \
-  -tls1_3 \
-  -groups X25519 \
-  -CAfile /etc/pq-gateway/certs/ca.crt \
-  -brief </dev/null
-```
-
-还需要验证 Hybrid 业务请求能够到达后端。`HEALTHY` 说明配置已加载和基础健康检查通过，不等于所有真实业务客户端已经验证完成。
-
-### 24.10 回滚兼容版本
-
-```bash
-make enterprise-history
-```
-
-假设之前的兼容版本为 `5`：
-
-```bash
-make enterprise-rollback VERSION=5
-
-sleep 5
-
-make enterprise-history
-make enterprise-status
-```
-
-实际操作必须使用当前历史中正确的兼容版本号。
-
-### 24.11 可观测组件
-
-```bash
-make dashboard-up
-```
-
-访问：
-
-```text
-Grafana:    http://127.0.0.1:3000
-Prometheus: http://127.0.0.1:9090
-OpenAPI:    http://127.0.0.1:18080/openapi.json
-```
-
-### 24.12 结束 Enterprise 实验
-
-先在临时 Python 后端终端按 `Ctrl+C`。
-
-停止 Enterprise：
-
-```bash
-docker compose \
-  --env-file .env.enterprise \
-  -f deploy/enterprise/docker-compose.yml \
-  --profile observability \
-  down --remove-orphans
-```
-
-企业数据库、证书、Token、扫描结果和发布历史仍保存在 `runtime-data/enterprise/`。
-
----
-
-## 25. 常见故障
-
-### 25.1 Manager API 返回 401
-
-普通实验和 Enterprise Manager API 同时占用 `18080`。停止旧实验 API：
-
-```bash
-docker stop pq-manager-api 2>/dev/null || true
-make enterprise-up
-make enterprise-capabilities
-```
-
-### 25.2 `payment-service.json` 不存在
-
-```bash
-cp config/enterprise/service-onboarding.example.json \
-  payment-service.json
-```
-
-### 25.3 `payment.internal` 无法解析
-
-`payment.internal` 是模板占位符。替换为真实或临时后端：
-
-```json
-"address": "http://127.0.0.1:18082"
-```
-
-### 25.4 临时后端端口被占用
-
-```bash
-ss -ltnp 'sport = :18082'
-curl -I http://127.0.0.1:18082/
-```
-
-如果已有服务不可用，改用 `18083`。
-
-### 25.5 新配置失败但 Gateway 仍为 HEALTHY
-
-如果：
-
-```text
-latest_release.status = NGINX_TEST_FAILED
-agent.current_version = 旧版本
-agent.status = HEALTHY
-```
-
-说明候选配置检查失败，旧健康版本仍在运行。修复上游地址或配置后重新发布，不需要删除数据库。
-
-### 25.6 扫描 API 返回空 502
-
-检查 Python 是否将本机请求交给代理：
-
-```bash
-python3 - <<'PY'
-import urllib.request
-print(urllib.request.proxy_bypass("127.0.0.1"))
-PY
-```
-
-需要返回 `True`。`127.*` 在部分 Python 环境中不能匹配 `127.0.0.1`。
-
----
-
-## 26. 最简命令索引
-
-普通完整实验：
-
-```bash
-make down
-make enterprise-down
-./scripts/run_full_experiment.sh --latest
-```
-
-Enterprise：
-
-```bash
-make enterprise-up
-make enterprise-status
-make enterprise-capabilities
-make enterprise-scan
-make enterprise-assets
-make enterprise-api-onboard SERVICE_FILE=payment-service.json
-make enterprise-history
-make dashboard-up
-```
-
-停止 Enterprise：
-
-```bash
-make enterprise-down
-```
+├──

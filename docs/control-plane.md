@@ -68,7 +68,7 @@ The Agent sequence is:
 
 ## Offline CLI (bootstrap and diagnostics)
 
-v3.6 customer day-2 operations use the Manager REST API. `pqctl` remains for
+v3.7 customer day-2 operations use the Manager REST API. `pqctl` remains for
 offline initialization, development and recovery when the API itself is not
 available; it is not the normal enterprise integration boundary.
 
@@ -100,7 +100,7 @@ python3 manager/pqctl.py metrics prometheus
 python3 manager/pqctl.py migration history compatibility-gateway
 ```
 
-## REST API (primary customer interface in v3.6)
+## REST API (primary customer interface in v3.7)
 
 The enterprise API binds to host loopback by default. Generate independent bearer and signing secrets before starting it:
 

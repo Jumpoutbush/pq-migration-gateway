@@ -1,6 +1,6 @@
-# Enterprise Deployment and API Operations (v3.6)
+# Enterprise Deployment and API Operations (v3.7)
 
-v3.6 separates the customer runtime from the deterministic demo experiment and makes all post-start control operations available through REST.
+v3.7 separates the customer runtime from the deterministic demo experiment and makes all post-start control operations available through REST.
 `docker-compose.yml` and `run_full_experiment.sh` remain the development and
 acceptance environment. `deploy/enterprise/docker-compose.yml` is the customer
 runtime and contains no demo bank, MQTT, TCP or secure backend.
@@ -34,7 +34,7 @@ administrator responsibility.
 
 Requirements: Linux or WSL2, Docker Compose, Python 3.10+, OpenSSL and Make.
 
-Build the v3.6 data-plane image once:
+Build the v3.7 data-plane image once:
 
 ```bash
 make build
@@ -196,7 +196,8 @@ curl -X POST \
   -d '{
     "type":"enterprise",
     "roots":["/workspace/project"],
-    "compile_commands":["/workspace/project/build/compile_commands.json"]
+    "compile_commands":["/workspace/project/build/compile_commands.json"],
+    "cpp_semantic":"auto"
   }' \
   http://127.0.0.1:18080/v1/scans
 ```
@@ -246,7 +247,36 @@ cat runtime-data/enterprise/metrics/current.json
 tail -f runtime-data/enterprise/metrics/history.jsonl
 ```
 
-## 7. Cut over real traffic
+## 7. Observe a running backend
+
+v3.7 can deploy a separate Runtime Agent on a backend host or container node:
+
+```bash
+make runtime-agent-build
+make runtime-agent-up
+make runtime-agent-status
+```
+
+Query the ingested processes and evidence:
+
+```bash
+make runtime-agents
+make runtime-observations
+make enterprise-assets
+```
+
+The default profile records process-map and container attribution. Actual call
+observation is an explicit privileged profile:
+
+```bash
+make runtime-agent-down
+make runtime-agent-ebpf-up
+```
+
+See [`runtime-agent.md`](runtime-agent.md) for the evidence model, separate
+Agent token, permissions, HTTPS requirements and WSL/kernel limitations.
+
+## 8. Cut over real traffic
 
 The framework deliberately does not modify DNS, load balancers or firewalls.
 Start with a new pilot SNI/port, test PQC-capable and legacy clients, and then
@@ -267,7 +297,7 @@ healthy, explicit application verification passes, and the measured classical
 fallback rate is below the migration plan gate. DNS/LB rollback and Gateway
 configuration rollback should both be rehearsed before production traffic.
 
-## 8. Security and production boundary
+## 9. Security and production boundary
 
 The enterprise profile runs application containers as the invoking host UID,
 uses a read-only root filesystem where supported, drops Linux capabilities and
