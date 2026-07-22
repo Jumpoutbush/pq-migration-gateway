@@ -24,7 +24,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        peer = self.connection.getpeercert() if isinstance(self.connection, ssl.SSLSocket) else {}
+        peer = (self.connection.getpeercert() or {}) \
+            if isinstance(self.connection, ssl.SSLSocket) else {}
         subject = ",".join("=".join(x) for rdn in peer.get("subject", ()) for x in rdn)
         payload = {
             "status": "ok",
